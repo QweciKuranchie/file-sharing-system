@@ -3,9 +3,13 @@ import os
 import datetime
 from functools import wraps
 import auth
+from database import init_db
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "super-secret-key-change-in-prod")
+
+# Ensure database tables exist on startup
+init_db()
 
 # Configure sessions to expire in 30 minutes of inactivity
 app.permanent_session_lifetime = datetime.timedelta(minutes=30)

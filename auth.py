@@ -6,6 +6,8 @@ Public API
 register_user(username, email, password) → user row dict
 login_user(username, password)           → JWT token string
 validate_token(token)                    → payload dict  (raises on failure)
+decode_token(token)                      → alias for validate_token
+get_user_by_id(user_id)                  → user row dict or None
 check_quota(user_id, file_size_bytes)    → bool
 update_quota(user_id, delta_bytes)       → None
 """
@@ -25,8 +27,12 @@ from database import get_connection
 
 # ── Custom exceptions ─────────────────────────────────────────────────────
 
-class AuthError(Exception):
-    """Base class for authentication / authorisation errors."""
+class AuthError(ValueError):
+    """Base class for authentication / authorisation errors.
+
+    Inherits from ``ValueError`` so that Flask routes using
+    ``except ValueError`` will catch auth-specific exceptions.
+    """
 
 
 class DuplicateUsernameError(AuthError):
@@ -214,6 +220,42 @@ def validate_token(token: str) -> dict[str, Any]:
         raise TokenError("Token has expired — please log in again")
     except jwt.InvalidTokenError as exc:
         raise TokenError(f"Invalid token: {exc}")
+
+
+# Alias used by app.py
+decode_token = validate_token
+
+
+# ── User lookup ───────────────────────────────────────────────────────────
+
+def get_user_by_id(user_id: int) -> dict[str, Any] | None:
+    """Fetch a user row by primary key.
+
+    Parameters
+    ----------
+    user_id : int
+        The user's ``id`` column value.
+
+    Returns
+    -------
+    dict or None
+        A dict with ``id``, ``username``, ``email``, ``quota_limit_bytes``,
+        ``quota_used_bytes``, and ``created_at``.  Returns ``None`` if the
+        user does not exist.
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT id, username, email, quota_limit_bytes,
+                   quota_used_bytes, created_at
+            FROM users WHERE id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
 
 
 # ── Quota helpers ─────────────────────────────────────────────────────────

@@ -65,6 +65,15 @@ db.sqlite3-journal
 instance/
 .webassets-cache
 
+# Project runtime files
+fileshare.db
+fileshare.db-wal
+fileshare.db-shm
+test_fileshare.db
+test_fileshare.db-wal
+test_fileshare.db-shm
+shared_files/
+
 # Scrapy stuff:
 .scrapy
 

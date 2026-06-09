@@ -1,0 +1,8 @@
+# Core web framework
+Flask>=3.0,<4.0
+
+# JWT authentication
+PyJWT>=2.8,<3.0
+
+# Password hashing (bundled with Flask via Werkzeug, listed explicitly for clarity)
+Werkzeug>=3.0,<4.0

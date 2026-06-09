@@ -141,7 +141,7 @@ file-sharing-system/
 | `password_hash` | TEXT | Werkzeug scrypt/pbkdf2 hash |
 | `quota_limit_bytes` | INTEGER | Default 52 428 800 (50 MB) |
 | `quota_used_bytes` | INTEGER | Default 0 |
-| `created_at` | TEXT | ISO 8601 timestamp |
+| `created_at` | TEXT | UTC ISO 8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`) |
 
 ### `files`
 
@@ -152,7 +152,7 @@ file-sharing-system/
 | `original_name` | TEXT | Name the user uploaded |
 | `file_type` | TEXT | File extension / MIME category |
 | `file_size_bytes` | INTEGER | Size in bytes |
-| `uploaded_at` | TEXT | ISO 8601 timestamp |
+| `uploaded_at` | TEXT | UTC ISO 8601 timestamp (`YYYY-MM-DDTHH:MM:SSZ`) |
 | `owner_id` | INTEGER | FK → `users.id`, cascade delete |
 
 ---

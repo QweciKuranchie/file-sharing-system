@@ -81,6 +81,9 @@ def handle_client(client_sock: socket.socket, addr: Tuple[str, int]) -> None:
                 filename = parts[1]
                 try:
                     size = int(parts[2])
+                    if size < 0:
+                        client_sock.sendall(b"ERROR INVALID_FILE_SIZE\n")
+                        continue
                 except ValueError:
                     client_sock.sendall(b"ERROR INVALID_COMMAND\n")
                     continue
@@ -140,15 +143,20 @@ def handle_client(client_sock: socket.socket, addr: Tuple[str, int]) -> None:
                         except FileExistsError:
                             counter += 1
                     
-                    # Call replication module skeleton
+                    # Call replication module with consistency checks
+                    replicated = False
                     try:
                         import replication
-                        replication.replicate_file(saved_name, size)
+                        replicated = replication.replicate_file(saved_name, size)
                     except Exception as rep_err:
                         logger.error(f"Replication failed to trigger for {saved_name}: {rep_err}")
                     
-                    client_sock.sendall(f"OK FILE_SAVED {saved_name}\n".encode('utf-8'))
-                    logger.info(f"File saved successfully: {saved_name} ({size} bytes)")
+                    if replicated:
+                        client_sock.sendall(f"OK FILE_SAVED {saved_name}\n".encode('utf-8'))
+                        logger.info(f"File saved and replicated successfully: {saved_name} ({size} bytes)")
+                    else:
+                        client_sock.sendall(f"ERROR REPLICATION_FAILED {saved_name}\n".encode('utf-8'))
+                        logger.warning(f"File saved on primary but replication failed: {saved_name}")
                 except Exception as save_err:
                     logger.error(f"Failed to save file {saved_name}: {save_err}")
                     client_sock.sendall(b"ERROR FILE_SAVE_FAILED\n")
@@ -165,19 +173,35 @@ def handle_client(client_sock: socket.socket, addr: Tuple[str, int]) -> None:
                     client_sock.sendall(b"ERROR FILE_NOT_FOUND\n")
                     continue
                 
+                # Pre-stream step: file open and size lookup
+                file_to_send = None
                 try:
                     size = os.path.getsize(filepath)
+                    file_to_send = open(filepath, 'rb')
+                except Exception as pre_err:
+                    logger.error(f"Pre-stream lookup failed for {filename}: {pre_err}")
+                    client_sock.sendall(b"ERROR DOWNLOAD_FAILED\n")
+                    if file_to_send:
+                        file_to_send.close()
+                    continue
+                
+                # Stream step
+                try:
                     client_sock.sendall(f"OK {size}\n".encode('utf-8'))
-                    
-                    with open(filepath, 'rb') as f:
+                    with file_to_send as f:
                         while True:
                             chunk = f.read(4096)
                             if not chunk:
                                 break
                             client_sock.sendall(chunk)
                     logger.info(f"Downloaded file: {filename} ({size} bytes) to {addr}")
-                except Exception as dl_err:
-                    logger.error(f"Download error for {filename}: {dl_err}")
+                except Exception as stream_err:
+                    logger.error(f"Streaming failed after header sent for {filename} to {addr}: {stream_err}")
+                    try:
+                        client_sock.close()
+                    except OSError:
+                        pass
+                    break
                     
             elif cmd == 'LIST':
                 try:
@@ -211,17 +235,28 @@ def handle_client(client_sock: socket.socket, addr: Tuple[str, int]) -> None:
                     continue
                 
                 try:
-                    os.remove(filepath)
+                    # Move to temporary name to allow rollback on replication failure
+                    temp_filepath = filepath + ".tmp_del"
+                    if os.path.exists(temp_filepath):
+                        os.remove(temp_filepath)
+                    os.rename(filepath, temp_filepath)
                     
-                    # Call replication propagation
+                    replicated = False
                     try:
                         import replication
-                        replication.propagate_delete(filename)
+                        replicated = replication.propagate_delete(filename)
                     except Exception as rep_err:
                         logger.error(f"Replication deletion failed for {filename}: {rep_err}")
-                        
-                    client_sock.sendall(b"OK FILE_DELETED\n")
-                    logger.info(f"Deleted file: {filename}")
+                    
+                    if replicated:
+                        os.remove(temp_filepath)
+                        client_sock.sendall(b"OK FILE_DELETED\n")
+                        logger.info(f"Deleted file and propagated deletion: {filename}")
+                    else:
+                        # Rollback local delete
+                        os.rename(temp_filepath, filepath)
+                        client_sock.sendall(b"ERROR REPLICATION_FAILED\n")
+                        logger.warning(f"Deletion failed to propagate, rolled back delete: {filename}")
                 except Exception as del_err:
                     logger.error(f"Delete failed for {filename}: {del_err}")
                     client_sock.sendall(b"ERROR DELETE_FAILED\n")
@@ -248,15 +283,21 @@ def handle_client(client_sock: socket.socket, addr: Tuple[str, int]) -> None:
                 try:
                     os.rename(old_path, new_path)
                     
-                    # Call replication propagation
+                    replicated = False
                     try:
                         import replication
-                        replication.propagate_rename(old_name, new_name)
+                        replicated = replication.propagate_rename(old_name, new_name)
                     except Exception as rep_err:
                         logger.error(f"Replication rename propagation failed: {rep_err}")
-                        
-                    client_sock.sendall(f"OK FILE_RENAMED {new_name}\n".encode('utf-8'))
-                    logger.info(f"Renamed file '{old_name}' to '{new_name}'")
+                    
+                    if replicated:
+                        client_sock.sendall(f"OK FILE_RENAMED {new_name}\n".encode('utf-8'))
+                        logger.info(f"Renamed file '{old_name}' to '{new_name}' and propagated")
+                    else:
+                        # Rollback rename
+                        os.rename(new_path, old_path)
+                        client_sock.sendall(b"ERROR REPLICATION_FAILED\n")
+                        logger.warning(f"Rename propagation failed, rolled back rename: '{old_name}'")
                 except Exception as ren_err:
                     logger.error(f"Rename failed from {old_name} to {new_name}: {ren_err}")
                     client_sock.sendall(b"ERROR RENAME_FAILED\n")

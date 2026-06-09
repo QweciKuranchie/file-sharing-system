@@ -3,13 +3,18 @@ auth.py — Authentication, JWT management, and quota helpers.
 
 Public API
 ----------
-register_user(username, email, password) → user row dict
-login_user(username, password)           → JWT token string
-validate_token(token)                    → payload dict  (raises on failure)
-decode_token(token)                      → alias for validate_token
-get_user_by_id(user_id)                  → user row dict or None
-check_quota(user_id, file_size_bytes)    → bool
-update_quota(user_id, delta_bytes)       → None
+register_user(username, email, password)  → user row dict
+login_user(username, password)            → JWT token string
+validate_token(token)                     → payload dict  (raises on failure)
+decode_token(token)                       → alias for validate_token
+get_user_by_id(user_id)                   → user row dict or None
+check_quota(user_id, file_size_bytes)     → bool
+reserve_quota(user_id, file_size_bytes)   → bool  (atomic check-and-increment)
+release_quota(user_id, file_size_bytes)   → None  (atomic rollback decrement)
+update_quota(user_id, delta_bytes)        → None
+
+# File metadata (re-exported from database for backwards compatibility)
+add_file, get_file_by_name, delete_file, rename_file, get_all_files
 """
 
 from __future__ import annotations
@@ -22,7 +27,15 @@ import jwt
 from werkzeug.security import generate_password_hash, check_password_hash
 
 from config import JWT_SECRET_KEY, JWT_ALGORITHM, JWT_EXPIRY_MINUTES
-from database import get_connection
+from database import (
+    get_connection,
+    init_db,
+    add_file,
+    get_file_by_name,
+    delete_file,
+    rename_file,
+    get_all_files,
+)
 
 
 # ── Custom exceptions ─────────────────────────────────────────────────────
@@ -98,31 +111,49 @@ def register_user(username: str, email: str, password: str) -> dict[str, Any]:
 
     conn = get_connection()
     try:
-        # Check for duplicate username
+        # Optimistic pre-checks for a friendly UX error message, but the
+        # INSERT below is the *authoritative* uniqueness check.  A concurrent
+        # insert can still slip through the SELECT window, so we also catch
+        # sqlite3.IntegrityError from the INSERT itself.
         existing = conn.execute(
             "SELECT id FROM users WHERE username = ?", (username,)
         ).fetchone()
         if existing:
             raise DuplicateUsernameError(f"Username already exists: {username}")
 
-        # Check for duplicate email
         existing = conn.execute(
             "SELECT id FROM users WHERE email = ?", (email,)
         ).fetchone()
         if existing:
             raise DuplicateEmailError(f"Email already registered: {email}")
 
-        # Insert new user
-        cursor = conn.execute(
-            """
-            INSERT INTO users (username, email, password_hash)
-            VALUES (?, ?, ?)
-            """,
-            (username, email, password_hash),
-        )
-        conn.commit()
+        # INSERT is the authoritative uniqueness check.
+        created_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO users (username, email, password_hash, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (username, email, password_hash, created_at),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError as exc:
+            conn.rollback()
+            # Translate the constraint name to a typed exception.
+            msg = str(exc).lower()
+            if "username" in msg:
+                raise DuplicateUsernameError(
+                    f"Username already exists: {username}"
+                ) from exc
+            if "email" in msg:
+                raise DuplicateEmailError(
+                    f"Email already registered: {email}"
+                ) from exc
+            # Unknown constraint — re-raise as generic auth error.
+            raise AuthError(f"Registration failed: {exc}") from exc
 
-        # Return the created user row (without password_hash)
+        # Return the created user row (without password_hash).
         user = conn.execute(
             """
             SELECT id, username, email, quota_limit_bytes,
@@ -331,3 +362,92 @@ def update_quota(user_id: int, delta_bytes: int) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def reserve_quota(user_id: int, file_size_bytes: int) -> bool:
+    """Atomically check and reserve quota for an upload in a single statement.
+
+    Uses a conditional ``UPDATE … WHERE quota_used_bytes + ? <= quota_limit_bytes``
+    so the check and increment happen inside one database write with no
+    time-of-check / time-of-use window between them.
+
+    Parameters
+    ----------
+    user_id : int
+        The primary-key id of the user.
+    file_size_bytes : int
+        The number of bytes to reserve.
+
+    Returns
+    -------
+    bool
+        ``True`` if quota was successfully reserved, ``False`` if the user
+        does not exist or the upload would exceed their limit.
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE users
+               SET quota_used_bytes = quota_used_bytes + ?
+             WHERE id = ?
+               AND quota_used_bytes + ? <= quota_limit_bytes
+            """,
+            (file_size_bytes, user_id, file_size_bytes),
+        )
+        conn.commit()
+        # rowcount == 1 means the condition was satisfied and the row updated.
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def release_quota(user_id: int, file_size_bytes: int) -> None:
+    """Atomically roll back a previously reserved quota amount.
+
+    Called by the upload route's failure-compensation path after a successful
+    ``reserve_quota`` but a downstream failure (TCP save or DB metadata write).
+    Uses a guarded ``UPDATE`` so ``quota_used_bytes`` can never go below zero.
+
+    Parameters
+    ----------
+    user_id : int
+        The primary-key id of the user.
+    file_size_bytes : int
+        The number of bytes to release (must be positive).
+
+    Raises
+    ------
+    ValueError
+        If the user does not exist or the decrement would underflow zero
+        (indicates a programming error — reserve/release mismatch).
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE users
+               SET quota_used_bytes = quota_used_bytes - ?
+             WHERE id = ?
+               AND quota_used_bytes - ? >= 0
+            """,
+            (file_size_bytes, user_id, file_size_bytes),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            # Either user not found or underflow guard triggered.
+            user_exists = conn.execute(
+                "SELECT 1 FROM users WHERE id = ?", (user_id,)
+            ).fetchone()
+            if not user_exists:
+                raise ValueError(f"No user found with id {user_id}")
+            raise ValueError(
+                f"release_quota underflow: releasing {file_size_bytes} bytes "
+                f"would drop quota_used_bytes below zero for user {user_id}"
+            )
+    finally:
+        conn.close()
+
+
+# Auto-initialize database on module import
+init_db()

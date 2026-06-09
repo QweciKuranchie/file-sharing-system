@@ -1,0 +1,37 @@
+{% extends 'base.html' %}
+
+{% block title %}Profile | CloudSync{% endblock %}
+
+{% block content %}
+<div style="text-align: center; padding: 4rem 2rem; max-width: 600px; margin: 0 auto; width: 100%;">
+    <div class="glass-card" style="padding: 3rem 2rem;">
+        <div style="margin-bottom: 1.5rem;">
+            <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="filter: drop-shadow(0 0 8px var(--accent-glow)); display: inline-block;">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                <circle cx="12" cy="7" r="4"></circle>
+            </svg>
+        </div>
+        <h1 class="auth-title" style="font-size: 2.2rem; margin-bottom: 1rem;">User Profile</h1>
+        <p style="color: var(--text-primary); font-weight: 500; margin-bottom: 0.5rem;">Username: <span style="color: var(--accent);">{{ g.user.username }}</span></p>
+        <p style="color: var(--text-secondary); font-size: 0.95rem; margin-bottom: 1.5rem;">Email: {{ g.user.email }}</p>
+        
+        <!-- Quota usage bar (FR-31/FR-33) -->
+        <div style="text-align: left; margin-top: 2rem;">
+            <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 0.5rem; color: var(--text-secondary);">
+                <span>Storage Quota</span>
+                {% set used_mb = g.user.quota_used_bytes / (1024*1024) %}
+                {% set limit_mb = g.user.quota_limit_bytes / (1024*1024) %}
+                <span>{{ "%.2f"|format(used_mb) }} MB / {{ "%.2f"|format(limit_mb) }} MB</span>
+            </div>
+            <div style="background: rgba(255,255,255,0.05); height: 8px; border-radius: 4px; overflow: hidden;">
+                {% set pct = (g.user.quota_used_bytes / g.user.quota_limit_bytes) * 100 %}
+                <div style="background: var(--accent); width: {{ pct }}%; height: 100%; border-radius: 4px;"></div>
+            </div>
+        </div>
+        
+        <div style="border-top: 1px solid var(--glass-border); padding-top: 1.5rem; margin-top: 2rem; color: var(--text-muted); font-size: 0.85rem;">
+            Detailed Profile Page features (FE-4) will be integrated in the next phases.
+        </div>
+    </div>
+</div>
+{% endblock %}

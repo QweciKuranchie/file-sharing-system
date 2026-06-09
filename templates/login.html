@@ -1,0 +1,39 @@
+{% extends 'base.html' %}
+
+{% block title %}Login | CloudSync{% endblock %}
+
+{% block content %}
+<div class="auth-wrapper">
+    <div class="glass-card">
+        <div class="auth-header">
+            <h1 class="auth-title">Welcome Back</h1>
+            <p class="auth-subtitle">Access your secure files on the local network</p>
+        </div>
+
+        <form method="POST" action="/login" id="login-form">
+            <div class="form-group">
+                <label for="username" class="form-label">Username or Email</label>
+                <div class="input-wrapper">
+                    <input type="text" id="username" name="username" class="form-input" placeholder="e.g. johndoe" required autocomplete="username">
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label for="password" class="form-label">Password</label>
+                <div class="input-wrapper">
+                    <input type="password" id="password" name="password" class="form-input" placeholder="••••••••" required autocomplete="current-password">
+                </div>
+            </div>
+
+            <button type="submit" class="btn btn-primary" id="login-submit-btn">
+                <span>Sign In</span>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>
+            </button>
+        </form>
+
+        <div class="auth-footer">
+            Don't have an account? <a href="/register" class="auth-link" id="link-to-register">Register here</a>
+        </div>
+    </div>
+</div>
+{% endblock %}

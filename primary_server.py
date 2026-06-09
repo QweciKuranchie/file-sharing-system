@@ -19,20 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logger = logging.getLogger("primary_server")
 
 
-def get_unique_filename(filename: str, directory: str) -> str:
-    """Return a unique filename by appending '_1', '_2', etc. if it already exists."""
-    path = os.path.join(directory, filename)
-    if not os.path.exists(path):
-        return filename
-
-    base, ext = os.path.splitext(filename)
-    counter = 1
-    while True:
-        new_filename = f"{base}_{counter}{ext}"
-        new_path = os.path.join(directory, new_filename)
-        if not os.path.exists(new_path):
-            return new_filename
-        counter += 1
+# Note: get_unique_filename has been replaced by inline atomic file creation in handle_client UPLOAD handler.
 
 
 def format_size(size_bytes: int) -> str:
@@ -131,13 +118,27 @@ def handle_client(client_sock: socket.socket, addr: Tuple[str, int]) -> None:
                 # Ensure directory exists
                 os.makedirs(SHARED_FILES_DIR, exist_ok=True)
                 
-                # Deduplicate filename
-                saved_name = get_unique_filename(filename, SHARED_FILES_DIR)
-                filepath = os.path.join(SHARED_FILES_DIR, saved_name)
+                # Deduplicate filename atomically using 'xb' mode
+                base, ext = os.path.splitext(filename)
+                counter = 0
+                saved_name = None
                 
                 try:
-                    with open(filepath, 'wb') as f:
-                        f.write(file_data)
+                    while True:
+                        if counter == 0:
+                            candidate_name = filename
+                        else:
+                            candidate_name = f"{base}_{counter}{ext}"
+                        
+                        filepath = os.path.join(SHARED_FILES_DIR, candidate_name)
+                        try:
+                            # 'xb' mode creates the file atomically; raises FileExistsError if it already exists
+                            with open(filepath, 'xb') as f:
+                                f.write(file_data)
+                            saved_name = candidate_name
+                            break
+                        except FileExistsError:
+                            counter += 1
                     
                     # Call replication module skeleton
                     try:

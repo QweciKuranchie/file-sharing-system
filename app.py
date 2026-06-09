@@ -4,6 +4,7 @@ import datetime
 from functools import wraps
 import socket
 import auth
+from database import init_db
 
 PRIMARY_HOST = os.environ.get("PRIMARY_HOST", "127.0.0.1")
 PRIMARY_PORT = int(os.environ.get("PRIMARY_PORT", 9000))
@@ -15,6 +16,9 @@ PRIMARY_DOWN = False
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "super-secret-key-change-in-prod")
+
+# Ensure database tables exist on startup
+init_db()
 
 # Configure sessions to expire in 30 minutes of inactivity
 app.permanent_session_lifetime = datetime.timedelta(minutes=30)

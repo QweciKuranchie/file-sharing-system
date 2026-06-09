@@ -3,9 +3,17 @@ import os
 import sqlite3
 import tempfile
 import socket
+
+# Override database path in config BEFORE importing app or database
+import config
+_TEST_DB_FD, _TEST_DB_PATH = tempfile.mkstemp(suffix=".db")
+os.close(_TEST_DB_FD)
+config.DATABASE_PATH = _TEST_DB_PATH
+
 from flask import session
 from unittest.mock import patch, MagicMock
 import auth
+from database import init_db
 from app import app
 
 class SocketMock:
@@ -39,32 +47,41 @@ class SocketMock:
         self.closed = True
 
 
+# Ensure database tables exist
+init_db()
+
 class TestAppRoutes(unittest.TestCase):
+    @classmethod
+    def tearDownClass(cls):
+        # Delete temporary database file and its WAL logs
+        try:
+            if os.path.exists(_TEST_DB_PATH):
+                os.remove(_TEST_DB_PATH)
+            for suffix in ["-wal", "-shm"]:
+                wal_path = _TEST_DB_PATH + suffix
+                if os.path.exists(wal_path):
+                    os.remove(wal_path)
+        except OSError:
+            pass
+
     def setUp(self):
         # Configure app for testing
         app.config['TESTING'] = True
         app.config['SECRET_KEY'] = 'test-secret-key'
         self.client = app.test_client()
         
-        # Create a temporary SQLite database
-        self.db_fd, self.test_db_path = tempfile.mkstemp(suffix=".db")
-        os.close(self.db_fd)
-        
-        # Override database path in auth module
-        auth.set_db_path(self.test_db_path)
-        
-        # Initialize schema
-        auth.init_db()
+        # Clear tables to ensure fresh state for each test
+        from database import get_connection
+        conn = get_connection()
+        try:
+            conn.execute("DELETE FROM users")
+            conn.execute("DELETE FROM files")
+            conn.commit()
+        finally:
+            conn.close()
 
     def tearDown(self):
-        # Restore default path
-        auth.set_db_path(auth.DEFAULT_DB_PATH)
-        # Delete temporary database file
-        try:
-            if os.path.exists(self.test_db_path):
-                os.remove(self.test_db_path)
-        except OSError:
-            pass
+        pass
 
     def test_unauthenticated_redirects(self):
         # Unauthenticated access to dashboard redirects to login

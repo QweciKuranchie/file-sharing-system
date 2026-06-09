@@ -752,6 +752,177 @@ class TestAppRoutes(unittest.TestCase):
         self.assertEqual(response.get_json()['status'], 'error')
         self.assertIn('Rename failed', response.get_json()['message'])
 
+class TestQuotaReservationIntegration:
+    """
+    HTTP-level tests verifying that the upload route correctly uses
+    reserve_quota / release_quota (atomic) rather than a non-atomic
+    check → update sequence.
+    """
+
+    def setUp_user(self, client, username, email):
+        """Helper: register + login a user, return their auth user_id."""
+        client.post('/register', data={
+            'username': username,
+            'email': email,
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        client.post('/login', data={
+            'username': username,
+            'password': 'password123'
+        })
+        token = auth.login_user(username, 'password123')
+        payload = auth.decode_token(token)
+        return payload['user_id']
+
+
+class TestQuotaReservation(unittest.TestCase):
+    """Integration: reserve_quota path in /upload.\""""
+
+    def setUp(self):
+        app.config['TESTING'] = True
+        app.config['SECRET_KEY'] = 'test-secret-key'
+        self.client = app.test_client()
+        from database import get_connection
+        conn = get_connection()
+        try:
+            conn.execute("DELETE FROM users")
+            conn.execute("DELETE FROM files")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def tearDown(self):
+        pass
+
+    def _register_login(self, username, email='test@example.com'):
+        self.client.post('/register', data={
+            'username': username,
+            'email': email,
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': username,
+            'password': 'password123'
+        })
+        token = auth.login_user(username, 'password123')
+        return auth.decode_token(token)['user_id']
+
+    @patch('app.socket.socket')
+    def test_reserve_quota_increments_on_successful_upload(self, mock_socket_class):
+        """quota_used_bytes should equal file_size after a successful upload."""
+        u_id = self._register_login('res_ok', 'res_ok@example.com')
+
+        sock_ping = SocketMock(b"OK PONG\n")
+        sock_upload = SocketMock(b"READY\nOK FILE_SAVED reserved_ok.txt\n")
+        mock_socket_class.side_effect = [sock_ping, sock_upload]
+
+        data = {'file': (tempfile.SpooledTemporaryFile(), 'reserved_ok.txt')}
+        data['file'][0].write(b"X" * 500)
+        data['file'][0].seek(0)
+
+        response = self.client.post('/upload', data=data, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 200)
+
+        user = auth.get_user_by_id(u_id)
+        self.assertIsNotNone(user)
+        self.assertEqual(user['quota_used_bytes'], 500)
+
+    @patch('app.socket.socket')
+    def test_quota_exhaustion_returns_403_no_db_change(self, mock_socket_class):
+        """When reserve_quota fails, upload returns 403 and quota is unchanged."""
+        u_id = self._register_login('res_full', 'res_full@example.com')
+        # Fill quota to 1 byte below limit (leaving only 1 byte free).
+        auth.update_quota(u_id, 52_428_800 - 1)
+
+        sock_ping = SocketMock(b"OK PONG\n")
+        mock_socket_class.side_effect = [sock_ping]
+
+        data = {'file': (tempfile.SpooledTemporaryFile(), 'overflow.txt')}
+        data['file'][0].write(b"XX")   # 2 bytes — 1 more than the remaining quota
+        data['file'][0].seek(0)
+
+        response = self.client.post('/upload', data=data, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 403)
+        self.assertIn('quota exceeded', response.get_json()['message'].lower())
+
+        # quota_used_bytes must be unchanged — no reservation was made.
+        user = auth.get_user_by_id(u_id)
+        self.assertIsNotNone(user)
+        self.assertEqual(user['quota_used_bytes'], 52_428_800 - 1)
+
+    @patch('app.socket.socket')
+    @patch('auth.add_file')
+    def test_quota_rolled_back_when_db_metadata_write_fails(self, mock_add_file, mock_socket_class):
+        """
+        reserve_quota succeeds, TCP saves the file, then auth.add_file raises →
+        the route must call release_quota so quota_used_bytes returns to 0.
+        """
+        u_id = self._register_login('res_rollback', 'res_rb@example.com')
+
+        mock_add_file.side_effect = Exception("Simulated DB failure")
+
+        sock_ping = SocketMock(b"OK PONG\n")
+        sock_upload = SocketMock(b"READY\nOK FILE_SAVED rb_file.txt\n")
+        sock_delete = SocketMock(b"OK FILE_DELETED\n")
+        mock_socket_class.side_effect = [sock_ping, sock_upload, sock_delete]
+
+        data = {'file': (tempfile.SpooledTemporaryFile(), 'rb_file.txt')}
+        data['file'][0].write(b"rollback me")
+        data['file'][0].seek(0)
+
+        response = self.client.post('/upload', data=data, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 500)
+
+        # Quota must be fully rolled back.
+        user = auth.get_user_by_id(u_id)
+        self.assertIsNotNone(user)
+        self.assertEqual(user['quota_used_bytes'], 0)
+
+        # Compensating DELETE must have been sent to the TCP server.
+        self.assertIn(b"DELETE rb_file.txt", sock_delete.sent_data)
+
+    @patch('app.socket.socket')
+    def test_concurrent_uploads_only_one_fits_remaining_quota(self, mock_socket_class):
+        """
+        Two simultaneous /upload requests where only one fits in the remaining
+        quota.  Exactly one must get HTTP 200, the other HTTP 403.
+        """
+        import threading
+
+        u_id = self._register_login('res_concurrent', 'res_con@example.com')
+        # Leave 8 MB free; each upload tries to claim 5 MB.
+        auth.update_quota(u_id, 52_428_800 - 8_000_000)
+
+        # Each request needs its own ping + upload sockets (only 1 will reach upload).
+        sock_ping1 = SocketMock(b"OK PONG\n")
+        sock_ping2 = SocketMock(b"OK PONG\n")
+        sock_upload = SocketMock(b"READY\nOK FILE_SAVED concurrent.txt\n")
+        mock_socket_class.side_effect = [sock_ping1, sock_upload, sock_ping2]
+
+        statuses: list[int] = []
+        lock = threading.Lock()
+
+        def do_upload():
+            data = {'file': (tempfile.SpooledTemporaryFile(), 'concurrent.txt')}
+            data['file'][0].write(b"A" * 5_000_000)
+            data['file'][0].seek(0)
+            resp = self.client.post('/upload', data=data, content_type='multipart/form-data')
+            with lock:
+                statuses.append(resp.status_code)
+
+        t1 = threading.Thread(target=do_upload)
+        t2 = threading.Thread(target=do_upload)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        self.assertIn(200, statuses)
+        self.assertIn(403, statuses)
+
+
 if __name__ == '__main__':
     unittest.main()
 

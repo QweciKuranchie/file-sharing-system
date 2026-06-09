@@ -145,7 +145,11 @@ def login():
     if request.method == 'POST':
         username_or_email = request.form.get('username')
         password = request.form.get('password')
-        
+
+        if not username_or_email or not password:
+            flash("Username and password are required.", "error")
+            return render_template('login.html', active_page='login')
+
         try:
             token = auth.login_user(username_or_email, password)
             session.permanent = True  # Enforce permanent session lifetime of 30 mins
@@ -166,7 +170,11 @@ def register():
         email = request.form.get('email')
         password = request.form.get('password')
         confirm_password = request.form.get('confirm_password')
-        
+
+        if not username or not email or not password:
+            flash("All fields are required.", "error")
+            return render_template('register.html', active_page='register')
+
         if password != confirm_password:
             flash("Passwords do not match.", "error")
             return render_template('register.html', active_page='register')
@@ -216,8 +224,10 @@ def upload_file():
         
     if not auth.reserve_quota(g.user['id'], file_size):
         return jsonify({"status": "error", "message": "Storage quota exceeded"}), 403
-        
+
     original_name = file.filename
+    if not original_name:
+        return jsonify({"status": "error", "message": "No file selected"}), 400
     safe_filename = os.path.basename(original_name.replace(" ", "_"))
     
     saved_on_server = False
@@ -240,20 +250,21 @@ def upload_file():
             }), 200
             
         elif "REPLICATION_FAILED" in response:
-            saved_name = safe_filename
+            parts = response.split(None, 2)
+            saved_name = parts[2] if len(parts) > 2 else safe_filename
             saved_on_server = True
             
-            file_type = get_file_type(safe_filename)
-            auth.add_file(safe_filename, original_name, file_type, file_size, g.user['id'])
+            file_type = get_file_type(saved_name)
+            auth.add_file(saved_name, original_name, file_type, file_size, g.user['id'])
             
             return jsonify({
                 "status": "warning", 
                 "message": "Uploaded but replication failed",
-                "filename": safe_filename
+                "filename": saved_name
             }), 207
             
         else:
-            auth.update_quota(g.user['id'], -file_size)
+            auth.release_quota(g.user['id'], file_size)
             return jsonify({
                 "status": "error", 
                 "message": f"Upload failed: {response}"
@@ -265,7 +276,7 @@ def upload_file():
                 send_tcp_command(PRIMARY_HOST, PRIMARY_PORT, f"DELETE {saved_name}")
             except Exception:
                 pass
-        auth.update_quota(g.user['id'], -file_size)
+        auth.release_quota(g.user['id'], file_size)
         return jsonify({
             "status": "error", 
             "message": "Upload failed. Try again."
@@ -324,7 +335,7 @@ def download_file(filename):
     headers = {
         'Content-Type': mime_type,
         'Content-Disposition': f'attachment; filename="{file_record["original_name"]}"',
-        'Content-Length': file_size
+        'Content-Length': str(file_size)
     }
     return Response(generate_bytes(s, file_size), headers=headers)
 
@@ -353,6 +364,8 @@ def delete_file(filename):
             return jsonify({"status": "success", "message": "File deleted from all servers"}), 200
         elif "FILE_NOT_FOUND" in response:
             return jsonify({"status": "error", "message": "File not found"}), 404
+        elif "REPLICATION_FAILED" in response:
+            return jsonify({"status": "error", "message": "Delete failed due to replication propagation error"}), 500
         elif "DELETE_FAILED" in response:
             return jsonify({"status": "error", "message": f"Delete failed: {response}"}), 500
         else:
@@ -406,6 +419,8 @@ def rename_file(filename):
             return jsonify({"status": "error", "message": "File not found"}), 404
         elif "NAME_CONFLICT" in response:
             return jsonify({"status": "error", "message": "A file with that name already exists"}), 409
+        elif "REPLICATION_FAILED" in response:
+            return jsonify({"status": "error", "message": "Rename failed due to replication propagation error"}), 500
         elif "RENAME_FAILED" in response:
             return jsonify({"status": "error", "message": f"Rename failed: {response}"}), 500
         else:
@@ -437,8 +452,4 @@ def profile():
 if __name__ == '__main__':
     # Default Flask port is 5000
     app.run(host='0.0.0.0', port=5000, debug=True)
-
-{
-  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe"
-}
 

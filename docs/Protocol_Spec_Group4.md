@@ -282,7 +282,7 @@ ERROR <error_message>\n
 | Request | `UPLOAD <filename> <filesize_in_bytes>` |
 | Flow | 1. Send command line → 2. Wait for `READY` → 3. Send file bytes → 4. Wait for response |
 | Success Response | `OK FILE_SAVED <saved_filename>` |
-| Failure Response | `ERROR <reason>` |
+| Failure Response | `ERROR <reason>` (e.g., `ERROR REPLICATION_FAILED <saved_filename>` or `ERROR INVALID_FILE_SIZE`) |
 | Example | `UPLOAD report.pdf 204800` |
 
 ---
@@ -320,7 +320,7 @@ ERROR <error_message>\n
 | Request | `DELETE <filename>` |
 | Flow | 1. Send command → 2. Primary deletes file → 3. Primary sends DELETE to replica → 4. Response sent |
 | Success Response | `OK FILE_DELETED` |
-| Failure Response | `ERROR FILE_NOT_FOUND` or `ERROR DELETE_FAILED` |
+| Failure Response | `ERROR FILE_NOT_FOUND`, `ERROR DELETE_FAILED`, or `ERROR REPLICATION_FAILED` |
 | Example | `DELETE report.pdf` |
 
 ---
@@ -333,7 +333,7 @@ ERROR <error_message>\n
 | Request | `RENAME <old_filename> <new_filename>` |
 | Flow | 1. Send command → 2. Primary renames file → 3. Primary sends RENAME to replica → 4. Response sent |
 | Success Response | `OK FILE_RENAMED <new_filename>` |
-| Failure Response | `ERROR FILE_NOT_FOUND` or `ERROR NAME_CONFLICT` |
+| Failure Response | `ERROR FILE_NOT_FOUND`, `ERROR NAME_CONFLICT`, `ERROR RENAME_FAILED`, or `ERROR REPLICATION_FAILED` |
 | Example | `RENAME draft.pdf final_report.pdf` |
 
 ---

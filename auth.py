@@ -241,5 +241,63 @@ def update_quota(user_id: int, delta: int):
     finally:
         conn.close()
 
+# File Metadata Helpers
+def add_file(filename, original_name, file_type, file_size_bytes, owner_id):
+    """Adds a new file to the files metadata table."""
+    conn = get_db_connection()
+    uploaded_at = datetime.utcnow().isoformat()
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO files (filename, original_name, file_type, file_size_bytes, uploaded_at, owner_id) VALUES (?, ?, ?, ?, ?, ?)",
+                (filename, original_name, file_type, file_size_bytes, uploaded_at, owner_id)
+            )
+    finally:
+        conn.close()
+
+def get_file_by_name(filename):
+    """Retrieves file details from database by filename."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute("SELECT id, filename, original_name, file_type, file_size_bytes, uploaded_at, owner_id FROM files WHERE filename = ?", (filename,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+def delete_file(filename):
+    """Deletes a file record from the database by filename."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            conn.execute("DELETE FROM files WHERE filename = ?", (filename,))
+    finally:
+        conn.close()
+
+def rename_file(old_filename, new_filename):
+    """Updates the filename and original_name of a file record in the database."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            conn.execute("UPDATE files SET filename = ?, original_name = ? WHERE filename = ?", (new_filename, new_filename, old_filename))
+    finally:
+        conn.close()
+
+def get_all_files():
+    """Retrieves all files with their owner usernames, sorted by upload date descending."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.execute("""
+            SELECT f.id, f.filename, f.original_name, f.file_type, f.file_size_bytes, f.uploaded_at, f.owner_id, u.username as owner_username
+            FROM files f
+            JOIN users u ON f.owner_id = u.id
+            ORDER BY f.uploaded_at DESC
+        """)
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
 # Auto-initialize database on module import
 init_db()
+

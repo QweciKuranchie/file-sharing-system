@@ -45,15 +45,23 @@ from auth import (                            # noqa: E402
 def fresh_database():
     """Create a clean database before every test, remove it afterwards."""
     # Teardown any leftover DB
-    if os.path.exists(_TEST_DB):
-        os.remove(_TEST_DB)
+    for path in [_TEST_DB, _TEST_DB + "-wal", _TEST_DB + "-shm"]:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     init_db()
     yield
 
     # Cleanup
-    if os.path.exists(_TEST_DB):
-        os.remove(_TEST_DB)
+    for path in [_TEST_DB, _TEST_DB + "-wal", _TEST_DB + "-shm"]:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
 
 def _register_default_user():
@@ -227,7 +235,7 @@ class TestJWT:
         payload = {
             "user_id": 1,
             "username": "kwame",
-            "exp": datetime.now(timezone.utc) - timedelta(seconds=1),
+            "exp": datetime.now(timezone.utc) - timedelta(minutes=5),
             "iat": datetime.now(timezone.utc) - timedelta(minutes=31),
         }
         expired_token = _jwt.encode(

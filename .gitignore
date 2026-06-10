@@ -230,3 +230,7 @@ __marimo__/
 .claude
 pyrightconfig.json
 fileshare.db
+
+# VS Code and runner scripts
+.vscode/
+powershell.bat

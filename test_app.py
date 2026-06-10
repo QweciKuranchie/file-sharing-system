@@ -47,6 +47,45 @@ class SocketMock:
         self.closed = True
 
 
+class DelayedBodySocketMock:
+    def __init__(self, response_bytes):
+        self.response_bytes = response_bytes
+        self.index = 0
+        self.sent_data = bytearray()
+        self.closed = False
+        self.timeout = None
+        self.header_read_done = False
+
+    def connect(self, addr):
+        pass
+
+    def settimeout(self, t):
+        self.timeout = t
+
+    def sendall(self, data):
+        self.sent_data.extend(data)
+
+    def recv(self, num_bytes):
+        if self.index >= len(self.response_bytes):
+            return b''
+            
+        if self.header_read_done:
+            if self.timeout is not None:
+                raise socket.timeout("unintended timeout: timeout remained 5s during body transfer")
+        
+        chunk = self.response_bytes[self.index : self.index + num_bytes]
+        self.index += len(chunk)
+        
+        if b'\n' in chunk and not self.header_read_done:
+            self.header_read_done = True
+            
+        return chunk
+
+    def close(self):
+        self.closed = True
+
+
+
 # Ensure database tables exist
 init_db()
 
@@ -221,6 +260,15 @@ class TestAppRoutes(unittest.TestCase):
         self.assertIsNotNone(user)
         self.assertEqual(user['quota_used_bytes'], 20)
 
+        # Verify that the uploaded file appears in the dashboard page (FE-2 metadata/actions check)
+        response = self.client.get('/dashboard')
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"test file.txt", response.data)
+        self.assertIn(b"uploader_file.txt", response.data)
+        self.assertIn(b"download-btn-uploader_file.txt", response.data)
+        self.assertIn(b"rename-btn-uploader_file.txt", response.data)
+        self.assertIn(b"delete-btn-uploader_file.txt", response.data)
+
     @patch('app.socket.socket')
     def test_upload_replication_warning(self, mock_socket_class):
         self.client.post('/register', data={
@@ -391,6 +439,78 @@ class TestAppRoutes(unittest.TestCase):
         self.assertEqual(response.data, b"replica data")
 
     @patch('app.socket.socket')
+    def test_download_primary_connect_fails_failover_to_replica(self, mock_socket_class):
+        self.client.post('/register', data={
+            'username': 'dl_conn_fail',
+            'email': 'dl_conn_fail@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'dl_conn_fail',
+            'password': 'password123'
+        })
+        
+        user_id = auth.login_user('dl_conn_fail', 'password123')
+        u_payload = auth.decode_token(user_id)
+        u_id = u_payload['user_id']
+        auth.add_file('conn_fail.txt', 'orig_conn_fail.txt', 'document', 12, u_id)
+        
+        # Reset the global failover state first
+        import app as app_module
+        app_module.PRIMARY_DOWN = False
+        
+        # 1. PING succeeds (1st socket)
+        sock_ping = SocketMock(b"OK PONG\n")
+        # 2. Primary download connection fails (2nd socket)
+        sock_primary = SocketMock(b"", raise_on_connect=ConnectionRefusedError("Offline"))
+        # 3. Replica download succeeds (3rd socket)
+        sock_replica = SocketMock(b"OK 12\nreplica data")
+        
+        mock_socket_class.side_effect = [sock_ping, sock_primary, sock_replica]
+        
+        response = self.client.get('/download/conn_fail.txt')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b"replica data")
+        self.assertTrue(app_module.PRIMARY_DOWN)
+
+    @patch('app.socket.socket')
+    def test_download_primary_header_read_fails_failover_to_replica(self, mock_socket_class):
+        self.client.post('/register', data={
+            'username': 'dl_hdr_fail',
+            'email': 'dl_hdr_fail@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'dl_hdr_fail',
+            'password': 'password123'
+        })
+        
+        user_id = auth.login_user('dl_hdr_fail', 'password123')
+        u_payload = auth.decode_token(user_id)
+        u_id = u_payload['user_id']
+        auth.add_file('hdr_fail.txt', 'orig_hdr_fail.txt', 'document', 12, u_id)
+        
+        # Reset the global failover state first
+        import app as app_module
+        app_module.PRIMARY_DOWN = False
+        
+        # 1. PING succeeds (1st socket)
+        sock_ping = SocketMock(b"OK PONG\n")
+        # 2. Primary download connection succeeds, but reading header returns empty/fails (2nd socket)
+        sock_primary = SocketMock(b"")
+        # 3. Replica download succeeds (3rd socket)
+        sock_replica = SocketMock(b"OK 12\nreplica data")
+        
+        mock_socket_class.side_effect = [sock_ping, sock_primary, sock_replica]
+        
+        response = self.client.get('/download/hdr_fail.txt')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b"replica data")
+        self.assertTrue(app_module.PRIMARY_DOWN)
+
+    @patch('app.socket.socket')
     def test_delete_success(self, mock_socket_class):
         self.client.post('/register', data={
             'username': 'deleter',
@@ -520,6 +640,38 @@ class TestAppRoutes(unittest.TestCase):
         self.assertEqual(files[1]['name'], 'file1.pdf')
         self.assertEqual(files[1]['size'], '200.0 KB')
         self.assertEqual(files[1]['type'], 'pdf')
+
+    def test_dashboard_file_listing(self):
+        # Register and login a user
+        self.client.post('/register', data={
+            'username': 'dash_user',
+            'email': 'dash@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'dash_user',
+            'password': 'password123'
+        })
+        
+        user_id = auth.login_user('dash_user', 'password123')
+        payload = auth.decode_token(user_id)
+        u_id = payload['user_id']
+        
+        # Add test files to DB
+        auth.add_file('dash_stored.pdf', 'My Cloud File.pdf', 'pdf', 1024, u_id)
+        
+        # Get dashboard
+        response = self.client.get('/dashboard')
+        self.assertEqual(response.status_code, 200)
+        
+        # Verify metadata and action entry points appear in the HTML
+        self.assertIn(b"My Cloud File.pdf", response.data)
+        self.assertIn(b"1.0 KB", response.data)
+        self.assertIn(b"dash_stored.pdf", response.data)
+        self.assertIn(b"download-btn-dash_stored.pdf", response.data)
+        self.assertIn(b"rename-btn-dash_stored.pdf", response.data)
+        self.assertIn(b"delete-btn-dash_stored.pdf", response.data)
 
     @patch('app.socket.socket')
     @patch('auth.add_file')
@@ -752,6 +904,293 @@ class TestAppRoutes(unittest.TestCase):
         self.assertEqual(response.get_json()['status'], 'error')
         self.assertIn('Rename failed', response.get_json()['message'])
 
+    @patch('app.socket.socket')
+    def test_upload_malformed_filename(self, mock_socket_class):
+        self.client.post('/register', data={
+            'username': 'mal_up',
+            'email': 'mal_up@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'mal_up',
+            'password': 'password123'
+        })
+        
+        sock_ping = SocketMock(b"OK PONG\n")
+        mock_socket_class.side_effect = [sock_ping]
+        
+        data = {
+            'file': (tempfile.SpooledTemporaryFile(), '../..')
+        }
+        data['file'][0].write(b"content")
+        data['file'][0].seek(0)
+        
+        response = self.client.post('/upload', data=data, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['status'], 'error')
+        self.assertEqual(response.get_json()['message'], 'Invalid filename')
+        # Only ping socket should be created, no upload socket
+        self.assertEqual(mock_socket_class.call_count, 1)
+
+    @patch('app.socket.socket')
+    def test_rename_malformed_filename(self, mock_socket_class):
+        self.client.post('/register', data={
+            'username': 'mal_ren',
+            'email': 'mal_ren@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'mal_ren',
+            'password': 'password123'
+        })
+        
+        user_id = auth.login_user('mal_ren', 'password123')
+        u_payload = auth.decode_token(user_id)
+        u_id = u_payload['user_id']
+        auth.add_file('existing.txt', 'existing.txt', 'document', 10, u_id)
+        
+        sock_ping = SocketMock(b"OK PONG\n")
+        mock_socket_class.side_effect = [sock_ping]
+        
+        response = self.client.post('/rename/existing.txt', data={'new_name': '..'})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['status'], 'error')
+        self.assertEqual(response.get_json()['message'], 'Invalid filename')
+        # Only ping socket should be created, no rename socket
+        self.assertEqual(mock_socket_class.call_count, 1)
+
+    @patch('app.socket.socket')
+    def test_upload_tcp_invalid_filename_mapping(self, mock_socket_class):
+        self.client.post('/register', data={
+            'username': 'tcp_invalid',
+            'email': 'tcp_invalid@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'tcp_invalid',
+            'password': 'password123'
+        })
+        
+        sock_ping = SocketMock(b"OK PONG\n")
+        sock_upload = SocketMock(b"ERROR INVALID_FILENAME\n")
+        mock_socket_class.side_effect = [sock_ping, sock_upload]
+        
+        data = {
+            'file': (tempfile.SpooledTemporaryFile(), 'test_invalid.txt')
+        }
+        data['file'][0].write(b"content")
+        data['file'][0].seek(0)
+        
+        response = self.client.post('/upload', data=data, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['status'], 'error')
+        self.assertEqual(response.get_json()['message'], 'Invalid filename')
+
+    @patch('app.socket.socket')
+    def test_rename_tcp_invalid_filename_mapping(self, mock_socket_class):
+        self.client.post('/register', data={
+            'username': 'tcp_ren_invalid',
+            'email': 'tcp_ren_invalid@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'tcp_ren_invalid',
+            'password': 'password123'
+        })
+        
+        user_id = auth.login_user('tcp_ren_invalid', 'password123')
+        u_payload = auth.decode_token(user_id)
+        u_id = u_payload['user_id']
+        auth.add_file('existing_tcp.txt', 'existing_tcp.txt', 'document', 10, u_id)
+        
+        sock_ping = SocketMock(b"OK PONG\n")
+        sock_rename = SocketMock(b"ERROR INVALID_FILENAME\n")
+        mock_socket_class.side_effect = [sock_ping, sock_rename]
+        
+        response = self.client.post('/rename/existing_tcp.txt', data={'new_name': 'new_invalid.txt'})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['status'], 'error')
+        self.assertEqual(response.get_json()['message'], 'Invalid filename')
+
+    @patch('app.socket.socket')
+    def test_upload_tcp_invalid_command_mapping(self, mock_socket_class):
+        self.client.post('/register', data={
+            'username': 'tcp_cmd',
+            'email': 'tcp_cmd@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'tcp_cmd',
+            'password': 'password123'
+        })
+        
+        sock_ping = SocketMock(b"OK PONG\n")
+        sock_upload = SocketMock(b"ERROR INVALID_COMMAND\n")
+        mock_socket_class.side_effect = [sock_ping, sock_upload]
+        
+        data = {
+            'file': (tempfile.SpooledTemporaryFile(), 'test_cmd.txt')
+        }
+        data['file'][0].write(b"content")
+        data['file'][0].seek(0)
+        
+        response = self.client.post('/upload', data=data, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['status'], 'error')
+        self.assertEqual(response.get_json()['message'], 'Invalid command')
+
+    @patch('app.socket.socket')
+    def test_download_success_delayed_body(self, mock_socket_class):
+        self.client.post('/register', data={
+            'username': 'dl_delayed',
+            'email': 'dl_delayed@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'dl_delayed',
+            'password': 'password123'
+        })
+        
+        user_id = auth.login_user('dl_delayed', 'password123')
+        u_payload = auth.decode_token(user_id)
+        u_id = u_payload['user_id']
+        
+        auth.add_file('delayed_file.txt', 'orig_delayed.txt', 'document', 11, u_id)
+        
+        sock_ping = SocketMock(b"OK PONG\n")
+        sock_download = DelayedBodySocketMock(b"OK 11\nhello world")
+        mock_socket_class.side_effect = [sock_ping, sock_download]
+        
+        # Reset the global failover state
+        import app as app_module
+        app_module.PRIMARY_DOWN = False
+        
+        response = self.client.get('/download/delayed_file.txt')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b"hello world")
+        self.assertEqual(response.headers['Content-Length'], '11')
+
+    @patch('app.socket.socket')
+    @patch('app.auth.delete_file_and_decrement_quota')
+    def test_delete_db_failure_reconciliation_success(self, mock_delete_helper, mock_socket_class):
+        self.client.post('/register', data={
+            'username': 'del_recon',
+            'email': 'del_recon@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'del_recon',
+            'password': 'password123'
+        })
+        
+        user_id = auth.login_user('del_recon', 'password123')
+        u_payload = auth.decode_token(user_id)
+        u_id = u_payload['user_id']
+        auth.add_file('del_recon.txt', 'del_recon.txt', 'document', 20, u_id)
+        auth.update_quota(u_id, 20)
+        
+        # Force the main helper to raise an exception
+        mock_delete_helper.side_effect = Exception("Simulated main DB failure")
+        
+        sock_ping = SocketMock(b"OK PONG\n")
+        sock_delete = SocketMock(b"OK FILE_DELETED\n")
+        mock_socket_class.side_effect = [sock_ping, sock_delete]
+        
+        response = self.client.post('/delete/del_recon.txt')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['status'], 'success')
+        
+        # Verify the file is still deleted locally (due to reconciliation)
+        self.assertIsNone(auth.get_file_by_name('del_recon.txt'))
+        user = auth.get_user_by_id(u_id)
+        self.assertEqual(user['quota_used_bytes'], 0)
+
+    @patch('app.socket.socket')
+    @patch('app.auth.delete_file_and_decrement_quota')
+    def test_delete_db_failure_reconciliation_failure(self, mock_delete_helper, mock_socket_class):
+        self.client.post('/register', data={
+            'username': 'del_recon_fail',
+            'email': 'del_recon_fail@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'del_recon_fail',
+            'password': 'password123'
+        })
+        
+        user_id = auth.login_user('del_recon_fail', 'password123')
+        u_payload = auth.decode_token(user_id)
+        u_id = u_payload['user_id']
+        auth.add_file('del_recon_fail.txt', 'del_recon_fail.txt', 'document', 20, u_id)
+        auth.update_quota(u_id, 20)
+        
+        fail_connection = False
+        def fail_delete_helper(*args, **kwargs):
+            nonlocal fail_connection
+            fail_connection = True
+            raise Exception("Simulated main DB failure")
+            
+        mock_delete_helper.side_effect = fail_delete_helper
+        
+        import database
+        original_get_connection = database.get_connection
+        def mock_get_conn_fn():
+            if fail_connection:
+                raise Exception("Simulated connection failure during reconciliation")
+            return original_get_connection()
+        
+        sock_ping = SocketMock(b"OK PONG\n")
+        sock_delete = SocketMock(b"OK FILE_DELETED\n")
+        mock_socket_class.side_effect = [sock_ping, sock_delete]
+        
+        with patch('database.get_connection', side_effect=mock_get_conn_fn):
+            response = self.client.post('/delete/del_recon_fail.txt')
+            
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json()['status'], 'error')
+
+    @patch('app.socket.socket')
+    @patch('app.auth.rename_file')
+    def test_rename_db_failure_compensation(self, mock_rename_helper, mock_socket_class):
+        self.client.post('/register', data={
+            'username': 'ren_comp',
+            'email': 'ren_comp@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'ren_comp',
+            'password': 'password123'
+        })
+        
+        user_id = auth.login_user('ren_comp', 'password123')
+        u_payload = auth.decode_token(user_id)
+        u_id = u_payload['user_id']
+        auth.add_file('ren_old.txt', 'ren_old.txt', 'document', 10, u_id)
+        
+        mock_rename_helper.side_effect = Exception("Simulated rename DB failure")
+        
+        sock_ping = SocketMock(b"OK PONG\n")
+        sock_rename = SocketMock(b"OK FILE_RENAMED ren_new.txt\n")
+        sock_compensate = SocketMock(b"OK FILE_RENAMED ren_old.txt\n")
+        mock_socket_class.side_effect = [sock_ping, sock_rename, sock_compensate]
+        
+        response = self.client.post('/rename/ren_old.txt', data={'new_name': 'ren_new.txt'})
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.get_json()['status'], 'error')
+        self.assertEqual(response.get_json()['message'], 'Rename failed')
+        
+        # Verify compensating RENAME was sent
+        self.assertIn(b"RENAME ren_new.txt ren_old.txt", sock_compensate.sent_data)
+
 class TestQuotaReservationIntegration:
     """
     HTTP-level tests verifying that the upload route correctly uses
@@ -783,6 +1222,7 @@ class TestQuotaReservation(unittest.TestCase):
         app.config['TESTING'] = True
         app.config['SECRET_KEY'] = 'test-secret-key'
         self.client = app.test_client()
+        init_db()
         from database import get_connection
         conn = get_connection()
         try:

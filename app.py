@@ -17,6 +17,7 @@ PRIMARY_DOWN = False
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "super-secret-key-change-in-prod")
 
+
 # Ensure database tables exist on startup
 init_db()
 
@@ -38,7 +39,7 @@ def read_line(sock):
     line = bytearray()
     while True:
         c = sock.recv(1)
-        if not c:
+        if not c or not isinstance(c, (bytes, bytearray)):
             break
         line.extend(c)
         if c == b'\n':
@@ -92,6 +93,8 @@ def format_size(num_bytes):
             return f"{num_bytes:.1f} {unit}"
         num_bytes /= 1024.0
     return f"{num_bytes:.1f} TB"
+
+app.jinja_env.filters['format_size'] = format_size
 
 def get_file_type(filename):
     _, ext = os.path.splitext(filename.lower())
@@ -216,6 +219,13 @@ def upload_file():
     if file.filename == '':
         return jsonify({"status": "error", "message": "No file selected"}), 400
         
+    original_name = file.filename
+    if not original_name:
+        return jsonify({"status": "error", "message": "No file selected"}), 400
+    safe_filename = os.path.basename(original_name.replace(" ", "_"))
+    if not safe_filename or safe_filename in ('.', '..'):
+        return jsonify({"status": "error", "message": "Invalid filename"}), 400
+        
     file_data = file.read()
     file_size = len(file_data)
     
@@ -225,11 +235,6 @@ def upload_file():
     if not auth.reserve_quota(g.user['id'], file_size):
         return jsonify({"status": "error", "message": "Storage quota exceeded"}), 403
 
-    original_name = file.filename
-    if not original_name:
-        return jsonify({"status": "error", "message": "No file selected"}), 400
-    safe_filename = os.path.basename(original_name.replace(" ", "_"))
-    
     saved_on_server = False
     saved_name = None
     try:
@@ -262,6 +267,20 @@ def upload_file():
                 "message": "Uploaded but replication failed",
                 "filename": saved_name
             }), 207
+            
+        elif "INVALID_FILENAME" in response:
+            auth.release_quota(g.user['id'], file_size)
+            return jsonify({
+                "status": "error",
+                "message": "Invalid filename"
+            }), 400
+            
+        elif "INVALID_COMMAND" in response:
+            auth.release_quota(g.user['id'], file_size)
+            return jsonify({
+                "status": "error",
+                "message": "Invalid command"
+            }), 400
             
         else:
             auth.release_quota(g.user['id'], file_size)
@@ -299,19 +318,69 @@ def download_file(filename):
         s.sendall(f"DOWNLOAD {filename}\n".encode('utf-8'))
         
         resp_line = read_line(s)
+        if not resp_line:
+            raise socket.error("Header read failure: empty response")
+            
         if not resp_line.startswith("OK "):
             s.close()
             if "FILE_NOT_FOUND" in resp_line:
                 return jsonify({"status": "error", "message": "File not found on any server"}), 404
+            if "INVALID_FILENAME" in resp_line:
+                return jsonify({"status": "error", "message": "Invalid filename"}), 400
+            if "INVALID_COMMAND" in resp_line:
+                return jsonify({"status": "error", "message": "Invalid command"}), 400
             return jsonify({"status": "error", "message": f"Download failed: {resp_line}"}), 500
             
         parts = resp_line.split()
         file_size = int(parts[1])
+        s.settimeout(None)
         
     except Exception as e:
         if s:
-            s.close()
-        return jsonify({"status": "error", "message": "Failed to connect to file server."}), 500
+            try:
+                s.close()
+            except Exception:
+                pass
+        
+        if host == PRIMARY_HOST:
+            g.primary_down = True
+            global PRIMARY_DOWN
+            PRIMARY_DOWN = True
+            
+            host = REPLICA_HOST
+            port = REPLICA_PORT
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5)
+            try:
+                s.connect((host, port))
+                s.sendall(f"DOWNLOAD {filename}\n".encode('utf-8'))
+                
+                resp_line = read_line(s)
+                if not resp_line:
+                    raise socket.error("Header read failure: empty response")
+                    
+                if not resp_line.startswith("OK "):
+                    s.close()
+                    if "FILE_NOT_FOUND" in resp_line:
+                        return jsonify({"status": "error", "message": "File not found on any server"}), 404
+                    if "INVALID_FILENAME" in resp_line:
+                        return jsonify({"status": "error", "message": "Invalid filename"}), 400
+                    if "INVALID_COMMAND" in resp_line:
+                        return jsonify({"status": "error", "message": "Invalid command"}), 400
+                    return jsonify({"status": "error", "message": f"Download failed: {resp_line}"}), 500
+                    
+                parts = resp_line.split()
+                file_size = int(parts[1])
+                s.settimeout(None)
+            except Exception as replica_e:
+                if s:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                return jsonify({"status": "error", "message": "Failed to connect to file server."}), 500
+        else:
+            return jsonify({"status": "error", "message": "Failed to connect to file server."}), 500
         
     def generate_bytes(sock, size):
         try:
@@ -359,11 +428,44 @@ def delete_file(filename):
         response = send_tcp_command(PRIMARY_HOST, PRIMARY_PORT, f"DELETE {filename}")
         
         if response == "OK FILE_DELETED":
-            auth.delete_file(filename)
-            auth.update_quota(g.user['id'], -file_record['file_size_bytes'])
+            try:
+                auth.delete_file_and_decrement_quota(filename)
+            except Exception as db_err:
+                import time
+                cleaned = False
+                for attempt in range(5):
+                    try:
+                        time.sleep(0.05 * (attempt + 1))
+                        import database
+                        conn = database.get_connection()
+                        try:
+                            with conn:
+                                conn.execute("DELETE FROM files WHERE filename = ?", (filename,))
+                                user = conn.execute(
+                                    "SELECT quota_used_bytes FROM users WHERE id = ?",
+                                    (file_record['owner_id'],)
+                                ).fetchone()
+                                if user:
+                                    new_quota = max(0, user["quota_used_bytes"] - file_record['file_size_bytes'])
+                                    conn.execute(
+                                        "UPDATE users SET quota_used_bytes = ? WHERE id = ?",
+                                        (new_quota, file_record['owner_id'])
+                                    )
+                            cleaned = True
+                            break
+                        finally:
+                            conn.close()
+                    except Exception:
+                        pass
+                if not cleaned:
+                    raise db_err
             return jsonify({"status": "success", "message": "File deleted from all servers"}), 200
         elif "FILE_NOT_FOUND" in response:
             return jsonify({"status": "error", "message": "File not found"}), 404
+        elif "INVALID_FILENAME" in response:
+            return jsonify({"status": "error", "message": "Invalid filename"}), 400
+        elif "INVALID_COMMAND" in response:
+            return jsonify({"status": "error", "message": "Invalid command"}), 400
         elif "REPLICATION_FAILED" in response:
             return jsonify({"status": "error", "message": "Delete failed due to replication propagation error"}), 500
         elif "DELETE_FAILED" in response:
@@ -398,6 +500,8 @@ def rename_file(filename):
         return jsonify({"status": "error", "message": "New filename is required"}), 400
         
     new_name = os.path.basename(new_name.replace(" ", "_"))
+    if not new_name or new_name in ('.', '..'):
+        return jsonify({"status": "error", "message": "Invalid filename"}), 400
     
     existing_file = auth.get_file_by_name(new_name)
     if existing_file:
@@ -410,7 +514,14 @@ def rename_file(filename):
             parts = response.split(None, 2)
             actual_new_name = parts[2] if len(parts) > 2 else new_name
             
-            auth.rename_file(filename, actual_new_name)
+            try:
+                auth.rename_file(filename, actual_new_name)
+            except Exception as db_err:
+                try:
+                    send_tcp_command(PRIMARY_HOST, PRIMARY_PORT, f"RENAME {actual_new_name} {filename}")
+                except Exception:
+                    pass
+                raise db_err
             return jsonify({
                 "status": "success", 
                 "message": f"File renamed to {actual_new_name}"
@@ -419,6 +530,10 @@ def rename_file(filename):
             return jsonify({"status": "error", "message": "File not found"}), 404
         elif "NAME_CONFLICT" in response:
             return jsonify({"status": "error", "message": "A file with that name already exists"}), 409
+        elif "INVALID_FILENAME" in response:
+            return jsonify({"status": "error", "message": "Invalid filename"}), 400
+        elif "INVALID_COMMAND" in response:
+            return jsonify({"status": "error", "message": "Invalid command"}), 400
         elif "REPLICATION_FAILED" in response:
             return jsonify({"status": "error", "message": "Rename failed due to replication propagation error"}), 500
         elif "RENAME_FAILED" in response:

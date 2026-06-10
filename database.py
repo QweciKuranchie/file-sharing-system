@@ -195,6 +195,37 @@ def delete_file(filename: str) -> None:
         conn.close()
 
 
+def delete_file_and_decrement_quota(filename: str) -> None:
+    """Delete the file record and decrement the owner's quota in a single transaction."""
+    conn = get_connection()
+    try:
+        with conn:
+            row = conn.execute(
+                "SELECT owner_id, file_size_bytes FROM files WHERE filename = ?",
+                (filename,)
+            ).fetchone()
+            if row:
+                owner_id = row["owner_id"]
+                file_size_bytes = row["file_size_bytes"]
+                
+                # Delete the file record
+                conn.execute("DELETE FROM files WHERE filename = ?", (filename,))
+                
+                # Decrement quota_used_bytes for the user
+                user = conn.execute(
+                    "SELECT quota_used_bytes FROM users WHERE id = ?",
+                    (owner_id,)
+                ).fetchone()
+                if user:
+                    new_quota = max(0, user["quota_used_bytes"] - file_size_bytes)
+                    conn.execute(
+                        "UPDATE users SET quota_used_bytes = ? WHERE id = ?",
+                        (new_quota, owner_id)
+                    )
+    finally:
+        conn.close()
+
+
 def rename_file(old_filename: str, new_filename: str) -> None:
     """Rename a file record in the database."""
     conn = get_connection()
@@ -219,7 +250,7 @@ def get_all_files() -> list[dict[str, Any]]:
                    u.username AS owner_username
             FROM files f
             JOIN users u ON f.owner_id = u.id
-            ORDER BY f.uploaded_at DESC
+            ORDER BY f.uploaded_at DESC, f.id DESC
             """
         ).fetchall()
         return [dict(row) for row in rows]

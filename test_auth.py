@@ -7,6 +7,7 @@ Run with:  python -m pytest test_auth.py -v
 import os
 import sys
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -210,6 +211,27 @@ class TestLogin:
         with pytest.raises(InvalidCredentialsError):
             login_user("", "")
 
+    def test_login_with_email_success(self):
+        _register_default_user()
+        token = login_user("kwame@example.com", "strongP@ss1")
+        assert isinstance(token, str)
+        assert len(token) > 0
+        # Verify the token contains the right user
+        from auth import decode_token
+        payload = decode_token(token)
+        assert payload["username"] == "kwame"
+
+    def test_login_with_email_case_insensitive(self):
+        _register_default_user()
+        token = login_user("Kwame@EXAMPLE.com", "strongP@ss1")
+        assert isinstance(token, str)
+        assert len(token) > 0
+
+    def test_login_with_nonexistent_email(self):
+        _register_default_user()
+        with pytest.raises(InvalidCredentialsError):
+            login_user("nobody@example.com", "strongP@ss1")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # AC-5  JWT validation rejects expired / tampered tokens
@@ -219,7 +241,16 @@ class TestJWT:
     def test_valid_token_decodes(self):
         _register_default_user()
         token = login_user("kwame", "strongP@ss1")
-        payload = validate_token(token)
+
+        # validate_token returns just the user_id (int)
+        user_id = validate_token(token)
+        assert isinstance(user_id, int)
+        assert user_id == 1
+
+        # decode_token returns the full payload (dict)
+        from auth import decode_token
+        payload = decode_token(token)
+        assert isinstance(payload, dict)
         assert payload["user_id"] == 1
         assert payload["username"] == "kwame"
 
@@ -712,12 +743,239 @@ class TestPrimaryServer:
             except OSError:
                 pass
             
-        sock = MockSocket(b"UPLOAD negative_test.txt -50\n")
+        from config import TCP_SHARED_SECRET
+        cmd = f"AUTH {TCP_SHARED_SECRET}\nUPLOAD negative_test.txt -50\n".encode('utf-8')
+        sock = MockSocket(cmd)
         handle_client(sock, ("127.0.0.1", 12345))
         
         # Verify response contains error
         assert b"ERROR" in sock.sent_data
         # Verify no file is created
         assert not os.path.exists(target_file)
+
+    @patch('replication.propagate_delete')
+    def test_delete_collision_safety(self, mock_prop):
+        from replication import ReplicationOutcome
+        from config import TCP_SHARED_SECRET
+        mock_prop.return_value = ReplicationOutcome.SUCCESS
+
+        # Ensure directory exists
+        os.makedirs(SHARED_FILES_DIR, exist_ok=True)
+        
+        target_file = os.path.join(SHARED_FILES_DIR, "collision_test.txt")
+        temp_del_file = os.path.join(SHARED_FILES_DIR, "collision_test.txt.tmp_del")
+        
+        with open(target_file, "w") as f:
+            f.write("original file")
+        with open(temp_del_file, "w") as f:
+            f.write("do not delete me")
+
+        # Now send delete command
+        cmd = f"AUTH {TCP_SHARED_SECRET}\nDELETE collision_test.txt\n".encode('utf-8')
+        sock = MockSocket(cmd)
+        handle_client(sock, ("127.0.0.1", 12345))
+
+        # Original target file should be deleted
+        assert not os.path.exists(target_file)
+        # The .tmp_del file must NOT be deleted!
+        assert os.path.exists(temp_del_file)
+        assert b"OK FILE_DELETED" in sock.sent_data
+
+        # Clean up
+        if os.path.exists(temp_del_file):
+            os.remove(temp_del_file)
+
+    @patch('replication.propagate_delete')
+    def test_delete_rejection_rollback(self, mock_prop):
+        from replication import ReplicationOutcome
+        from config import TCP_SHARED_SECRET
+        mock_prop.return_value = ReplicationOutcome.REJECTED
+
+        os.makedirs(SHARED_FILES_DIR, exist_ok=True)
+        target_file = os.path.join(SHARED_FILES_DIR, "rollback_test.txt")
+        with open(target_file, "w") as f:
+            f.write("rollback test")
+
+        cmd = f"AUTH {TCP_SHARED_SECRET}\nDELETE rollback_test.txt\n".encode('utf-8')
+        sock = MockSocket(cmd)
+        handle_client(sock, ("127.0.0.1", 12345))
+
+        # Deleted on primary initially, but since rejected, rolled back!
+        assert os.path.exists(target_file)
+        assert b"ERROR REPLICATION_FAILED" in sock.sent_data
+
+        # Clean up
+        if os.path.exists(target_file):
+            os.remove(target_file)
+
+    @patch('replication.propagate_delete')
+    def test_delete_ambiguous_rollback(self, mock_prop):
+        from replication import ReplicationOutcome
+        from config import TCP_SHARED_SECRET
+        mock_prop.return_value = ReplicationOutcome.AMBIGUOUS
+
+        os.makedirs(SHARED_FILES_DIR, exist_ok=True)
+        target_file = os.path.join(SHARED_FILES_DIR, "ambig_test.txt")
+        with open(target_file, "w") as f:
+            f.write("ambig test")
+
+        cmd = f"AUTH {TCP_SHARED_SECRET}\nDELETE ambig_test.txt\n".encode('utf-8')
+        sock = MockSocket(cmd)
+        handle_client(sock, ("127.0.0.1", 12345))
+
+        # Ambiguous outcome -> rolled back on primary!
+        assert os.path.exists(target_file)
+        assert b"ERROR REPLICATION_FAILED" in sock.sent_data
+
+        # Clean up
+        if os.path.exists(target_file):
+            os.remove(target_file)
+
+    @patch('replication.propagate_rename')
+    def test_rename_rejection_rollback(self, mock_prop):
+        from replication import ReplicationOutcome
+        from config import TCP_SHARED_SECRET
+        mock_prop.return_value = ReplicationOutcome.REJECTED
+
+        os.makedirs(SHARED_FILES_DIR, exist_ok=True)
+        old_path = os.path.join(SHARED_FILES_DIR, "rename_old.txt")
+        new_path = os.path.join(SHARED_FILES_DIR, "rename_new.txt")
+        with open(old_path, "w") as f:
+            f.write("rename test")
+        if os.path.exists(new_path):
+            os.remove(new_path)
+
+        cmd = f"AUTH {TCP_SHARED_SECRET}\nRENAME rename_old.txt rename_new.txt\n".encode('utf-8')
+        sock = MockSocket(cmd)
+        handle_client(sock, ("127.0.0.1", 12345))
+
+        # Rejected -> rolled back to rename_old.txt!
+        assert os.path.exists(old_path)
+        assert not os.path.exists(new_path)
+        assert b"ERROR REPLICATION_FAILED" in sock.sent_data
+
+        # Clean up
+        if os.path.exists(old_path):
+            os.remove(old_path)
+
+    @patch('replication.propagate_rename')
+    def test_rename_ambiguous_rollback(self, mock_prop):
+        from replication import ReplicationOutcome
+        from config import TCP_SHARED_SECRET
+        mock_prop.return_value = ReplicationOutcome.AMBIGUOUS
+
+        os.makedirs(SHARED_FILES_DIR, exist_ok=True)
+        old_path = os.path.join(SHARED_FILES_DIR, "rename_ambig_old.txt")
+        new_path = os.path.join(SHARED_FILES_DIR, "rename_ambig_new.txt")
+        with open(old_path, "w") as f:
+            f.write("rename test")
+        if os.path.exists(new_path):
+            os.remove(new_path)
+
+        cmd = f"AUTH {TCP_SHARED_SECRET}\nRENAME rename_ambig_old.txt rename_ambig_new.txt\n".encode('utf-8')
+        sock = MockSocket(cmd)
+        handle_client(sock, ("127.0.0.1", 12345))
+
+        # Ambiguous -> rolled back to old path!
+        assert os.path.exists(old_path)
+        assert not os.path.exists(new_path)
+        assert b"ERROR REPLICATION_FAILED" in sock.sent_data
+
+        # Clean up
+        if os.path.exists(old_path):
+            os.remove(old_path)
+
+    @patch('replication._connect')
+    def test_replication_ack_timeout(self, mock_connect):
+        import socket
+        class TimeoutMockSocket:
+            def __init__(self):
+                self.calls = 0
+                self.closed = False
+            def sendall(self, data):
+                pass
+            def recv(self, size):
+                self.calls += 1
+                if self.calls == 1:
+                    return b"READY\n"
+                else:
+                    raise socket.timeout("timed out waiting for ack")
+            def settimeout(self, t):
+                pass
+            def close(self):
+                self.closed = True
+
+        mock_socket = TimeoutMockSocket()
+        mock_connect.return_value = mock_socket
+
+        # Create a dummy file to replicate
+        os.makedirs(SHARED_FILES_DIR, exist_ok=True)
+        dummy_file = os.path.join(SHARED_FILES_DIR, "dummy_replicate.txt")
+        with open(dummy_file, "w") as f:
+            f.write("hello")
+
+        from replication import replicate_file
+        # Try to replicate — should return False (failure) and not raise/hang
+        res = replicate_file("dummy_replicate.txt", dummy_file)
+        assert res is False
+        assert mock_socket.closed is True
+
+        # Clean up
+        if os.path.exists(dummy_file):
+            os.remove(dummy_file)
+
+    def test_tcp_auth_validation(self):
+        from config import TCP_SHARED_SECRET
+        
+        # Test 7.1: Connecting without AUTH first
+        sock = MockSocket(b"PING\n")
+        handle_client(sock, ("127.0.0.1", 12345))
+        assert b"ERROR UNAUTHORIZED" in sock.sent_data
+        
+        # Test 7.2: Connecting with invalid secret
+        sock = MockSocket(b"AUTH wrongsecret\nPING\n")
+        handle_client(sock, ("127.0.0.1", 12345))
+        assert b"ERROR UNAUTHORIZED" in sock.sent_data
+        
+        # Test 7.3: Connecting with valid secret
+        sock = MockSocket(f"AUTH {TCP_SHARED_SECRET}\nPING\n".encode('utf-8'))
+        handle_client(sock, ("127.0.0.1", 12345))
+        assert b"OK AUTHENTICATED" in sock.sent_data
+        assert b"OK PONG" in sock.sent_data
+
+
+class TestReplicaServer:
+    def test_replica_write_restriction(self):
+        from replica_server import handle_client as replica_handle_client
+        from config import TCP_CLIENT_SECRET, TCP_REPLICATION_SECRET
+
+        # Test 1: Authenticating with TCP_CLIENT_SECRET (read-only client role)
+        # Mutating command DELETE should fail with ERROR WRITE_NOT_ALLOWED
+        cmd_client = f"AUTH {TCP_CLIENT_SECRET}\nDELETE file.txt\n".encode('utf-8')
+        sock = MockSocket(cmd_client)
+        replica_handle_client(sock, ("127.0.0.1", 12345))
+        assert b"OK AUTHENTICATED" in sock.sent_data
+        assert b"ERROR WRITE_NOT_ALLOWED" in sock.sent_data
+
+        # Mutating command RENAME should fail with ERROR WRITE_NOT_ALLOWED
+        cmd_client_rename = f"AUTH {TCP_CLIENT_SECRET}\nRENAME old.txt new.txt\n".encode('utf-8')
+        sock = MockSocket(cmd_client_rename)
+        replica_handle_client(sock, ("127.0.0.1", 12345))
+        assert b"ERROR WRITE_NOT_ALLOWED" in sock.sent_data
+
+        # Mutating command REPLICATE should fail with ERROR WRITE_NOT_ALLOWED
+        cmd_client_replicate = f"AUTH {TCP_CLIENT_SECRET}\nREPLICATE file.txt 100\n".encode('utf-8')
+        sock = MockSocket(cmd_client_replicate)
+        replica_handle_client(sock, ("127.0.0.1", 12345))
+        assert b"ERROR WRITE_NOT_ALLOWED" in sock.sent_data
+
+        # Test 2: Authenticating with TCP_REPLICATION_SECRET (replication role)
+        # Mutating command DELETE should NOT return ERROR WRITE_NOT_ALLOWED (but rather ERROR FILE_NOT_FOUND)
+        cmd_rep = f"AUTH {TCP_REPLICATION_SECRET}\nDELETE file.txt\n".encode('utf-8')
+        sock = MockSocket(cmd_rep)
+        replica_handle_client(sock, ("127.0.0.1", 12345))
+        assert b"OK AUTHENTICATED" in sock.sent_data
+        assert b"ERROR WRITE_NOT_ALLOWED" not in sock.sent_data
+        assert b"ERROR FILE_NOT_FOUND" in sock.sent_data
 
 

@@ -73,6 +73,7 @@ test_fileshare.db
 test_fileshare.db-wal
 test_fileshare.db-shm
 shared_files/
+shared_files_replica/
 
 # Scrapy stuff:
 .scrapy
@@ -229,3 +230,7 @@ __marimo__/
 .claude
 pyrightconfig.json
 fileshare.db
+
+# VS Code and runner scripts
+.vscode/
+powershell.bat

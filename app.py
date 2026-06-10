@@ -14,8 +14,25 @@ REPLICA_PORT = int(os.environ.get("REPLICA_PORT", 9001))
 PRIMARY_DOWN = False
 
 
+import sys
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "super-secret-key-change-in-prod")
+
+# Enforce SECRET_KEY security boundary
+secret_key = os.environ.get("SECRET_KEY")
+if not secret_key:
+    is_testing = ("pytest" in sys.modules or "unittest" in sys.modules or "pytest_current_test" in os.environ)
+    if is_testing:
+        secret_key = "test-secret-key-12345"
+    else:
+        raise RuntimeError("SECRET_KEY environment variable is required but not set.")
+app.secret_key = secret_key
+
+# Set explicit session cookie security options
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=os.environ.get("SESSION_COOKIE_SECURE", "false").lower() in ("true", "1")
+)
 
 
 # Ensure database tables exist on startup
@@ -46,25 +63,51 @@ def read_line(sock):
             break
     return line.decode('utf-8').strip()
 
-def ping_server(host, port, timeout=5):
+def connect_and_authenticate(host, port, timeout=5):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
+    if timeout is not None:
+        s.settimeout(timeout)
     try:
         s.connect((host, port))
+        from config import TCP_CLIENT_SECRET
+        s.sendall(f"AUTH {TCP_CLIENT_SECRET}\n".encode('utf-8'))
+        auth_resp = read_line(s)
+        if auth_resp != "OK AUTHENTICATED":
+            raise PermissionError(f"Authentication failed: {auth_resp}")
+        return s
+    except Exception as e:
+        try:
+            s.close()
+        except OSError:
+            pass
+        raise e
+
+def ping_server(host, port, timeout=5):
+    s = None
+    try:
+        s = connect_and_authenticate(host, port, timeout)
         s.sendall(b"PING\n")
         resp = read_line(s)
         return resp == "OK PONG"
     except Exception:
         return False
     finally:
-        s.close()
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
 
 def send_tcp_command(host, port, command_str, file_data=None, timeout=5):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    if timeout is not None:
-        s.settimeout(timeout)
+    s = None
     try:
-        s.connect((host, port))
+        s = connect_and_authenticate(host, port, timeout)
+    except PermissionError:
+        return "ERROR UNAUTHORIZED"
+    except Exception:
+        return "ERROR CONNECTION_FAILED"
+        
+    try:
         if not command_str.endswith('\n'):
             command_str += '\n'
         s.sendall(command_str.encode('utf-8'))
@@ -83,7 +126,11 @@ def send_tcp_command(host, port, command_str, file_data=None, timeout=5):
             resp = read_line(s)
             return resp
     finally:
-        s.close()
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
 
 def format_size(num_bytes):
     for unit in ['B', 'KB', 'MB', 'GB']:
@@ -109,17 +156,30 @@ def get_file_type(filename):
     else:
         return 'other'
 
+import time
+
+_LAST_HEALTH_CHECK_TIME = 0
+_HEALTH_CHECK_CACHE_DURATION = 5.0 # cache health check for 5 seconds
+
+@app.before_request
+def check_primary_health():
+    global PRIMARY_DOWN, _LAST_HEALTH_CHECK_TIME
+    # Only run health checks for non-static, non-auth endpoints
+    if not request.endpoint or request.endpoint in ('static', 'login', 'register', 'logout', 'index'):
+        g.primary_down = PRIMARY_DOWN  # fallback or default
+        return
+    now = time.time()
+    if now - _LAST_HEALTH_CHECK_TIME > _HEALTH_CHECK_CACHE_DURATION:
+        # Use a short 1-second timeout so it doesn't block the caller too long
+        PRIMARY_DOWN = not ping_server(PRIMARY_HOST, PRIMARY_PORT, timeout=1.0)
+        _LAST_HEALTH_CHECK_TIME = now
+        
+    g.primary_down = PRIMARY_DOWN
+
+
 @app.before_request
 def load_user():
     """Runs before every request. Populates g.user from JWT token in session, or clears invalid sessions."""
-    global PRIMARY_DOWN
-    
-    # Check primary server availability on page/API requests
-    if request.endpoint and request.endpoint != 'static':
-        PRIMARY_DOWN = not ping_server(PRIMARY_HOST, PRIMARY_PORT, timeout=5)
-        
-    g.primary_down = PRIMARY_DOWN
-    
     token = session.get('token')
     g.user = None
     if token:
@@ -129,7 +189,11 @@ def load_user():
             g.user = auth.get_user_by_id(payload['user_id'])
             if not g.user:
                 session.pop('token', None)
-        except Exception:
+            else:
+                # Refresh token on active requests
+                new_token = auth.refresh_token(token)
+                session['token'] = new_token
+        except auth.TokenError:
             # If the JWT has expired or is invalid, clear it silently from session
             session.pop('token', None)
 
@@ -151,15 +215,19 @@ def login():
 
         if not username_or_email or not password:
             flash("Username and password are required.", "error")
-            return render_template('login.html', active_page='login')
+            return render_template('login.html', active_page='login'), 400
 
         try:
             token = auth.login_user(username_or_email, password)
             session.permanent = True  # Enforce permanent session lifetime of 30 mins
             session['token'] = token
             return redirect(url_for('dashboard'))
+        except auth.InvalidCredentialsError as e:
+            flash(str(e), "error")
+            return render_template('login.html', active_page='login'), 200
         except ValueError as e:
             flash(str(e), "error")
+            return render_template('login.html', active_page='login'), 400
             
     return render_template('login.html', active_page='login')
 
@@ -176,18 +244,25 @@ def register():
 
         if not username or not email or not password:
             flash("All fields are required.", "error")
-            return render_template('register.html', active_page='register')
+            return render_template('register.html', active_page='register'), 400
 
         if password != confirm_password:
             flash("Passwords do not match.", "error")
-            return render_template('register.html', active_page='register')
+            return render_template('register.html', active_page='register'), 400
             
         try:
             auth.register_user(username, email, password)
             flash("Registration successful! Please login.", "success")
             return redirect(url_for('login'))
+        except auth.DuplicateUsernameError as e:
+            flash(str(e), "error")
+            return render_template('register.html', active_page='register'), 409
+        except auth.DuplicateEmailError as e:
+            flash(str(e), "error")
+            return render_template('register.html', active_page='register'), 409
         except ValueError as e:
             flash(str(e), "error")
+            return render_template('register.html', active_page='register'), 400
             
     return render_template('register.html', active_page='register')
 
@@ -291,11 +366,29 @@ def upload_file():
             
     except Exception as e:
         if saved_on_server and saved_name:
+            # Attempt compensating DELETE to clean up the orphaned file
+            delete_succeeded = False
             try:
-                send_tcp_command(PRIMARY_HOST, PRIMARY_PORT, f"DELETE {saved_name}")
+                del_response = send_tcp_command(PRIMARY_HOST, PRIMARY_PORT, f"DELETE {saved_name}")
+                if del_response and "FILE_DELETED" in del_response:
+                    delete_succeeded = True
             except Exception:
                 pass
-        auth.release_quota(g.user['id'], file_size)
+
+            if delete_succeeded:
+                # File removed from disk — safe to release the quota reservation
+                auth.release_quota(g.user['id'], file_size)
+            else:
+                # File still exists on disk — retain quota to keep accounting accurate
+                import logging
+                logging.getLogger("app").critical(
+                    f"Compensating DELETE failed for '{saved_name}' "
+                    f"(user {g.user['id']}). Quota retained for "
+                    f"{file_size} bytes — manual reconciliation required."
+                )
+        else:
+            # File was never saved on the server — safe to release quota
+            auth.release_quota(g.user['id'], file_size)
         return jsonify({
             "status": "error", 
             "message": "Upload failed. Try again."
@@ -311,10 +404,9 @@ def download_file(filename):
     host = REPLICA_HOST if g.primary_down else PRIMARY_HOST
     port = REPLICA_PORT if g.primary_down else PRIMARY_PORT
     
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(5)
+    s = None
     try:
-        s.connect((host, port))
+        s = connect_and_authenticate(host, port, timeout=5)
         s.sendall(f"DOWNLOAD {filename}\n".encode('utf-8'))
         
         resp_line = read_line(s)
@@ -349,10 +441,9 @@ def download_file(filename):
             
             host = REPLICA_HOST
             port = REPLICA_PORT
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5)
+            s = None
             try:
-                s.connect((host, port))
+                s = connect_and_authenticate(host, port, timeout=5)
                 s.sendall(f"DOWNLOAD {filename}\n".encode('utf-8'))
                 
                 resp_line = read_line(s)
@@ -468,6 +559,8 @@ def delete_file(filename):
             return jsonify({"status": "error", "message": "Invalid command"}), 400
         elif "REPLICATION_FAILED" in response:
             return jsonify({"status": "error", "message": "Delete failed due to replication propagation error"}), 500
+        elif "REPLICATION_AMBIGUOUS" in response:
+            return jsonify({"status": "error", "message": "Delete propagation is ambiguous. File removed locally but replica status is unknown."}), 500
         elif "DELETE_FAILED" in response:
             return jsonify({"status": "error", "message": f"Delete failed: {response}"}), 500
         else:
@@ -536,6 +629,8 @@ def rename_file(filename):
             return jsonify({"status": "error", "message": "Invalid command"}), 400
         elif "REPLICATION_FAILED" in response:
             return jsonify({"status": "error", "message": "Rename failed due to replication propagation error"}), 500
+        elif "RENAME_AMBIGUOUS" in response:
+            return jsonify({"status": "error", "message": "Rename propagation is ambiguous. File renamed locally but replica status is unknown."}), 500
         elif "RENAME_FAILED" in response:
             return jsonify({"status": "error", "message": f"Rename failed: {response}"}), 500
         else:
@@ -566,5 +661,6 @@ def profile():
 
 if __name__ == '__main__':
     # Default Flask port is 5000
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    debug_mode = os.environ.get("FLASK_DEBUG", "false").lower() in ("true", "1")
+    app.run(host='0.0.0.0', port=5000, debug=debug_mode)
 

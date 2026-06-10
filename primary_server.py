@@ -117,7 +117,15 @@ def handle_client(client_sock: socket.socket, addr: Tuple[str, int]) -> None:
                 
                 # Sanitize filename to prevent directory traversal
                 filename = os.path.basename(filename)
-                if not filename:
+                import re
+                if (not filename or 
+                    filename in ('.', '..') or 
+                    '..' in filename or 
+                    filename.startswith('.') or 
+                    filename.startswith('-') or 
+                    filename.endswith('.') or 
+                    filename.endswith('-') or 
+                    not re.match(r'^[a-zA-Z0-9_\-\.]+$', filename)):
                     client_sock.sendall(b"ERROR INVALID_FILENAME\n")
                     continue
                 
@@ -194,6 +202,18 @@ def handle_client(client_sock: socket.socket, addr: Tuple[str, int]) -> None:
                     continue
                 
                 filename = os.path.basename(parts[1])
+                import re
+                if (not filename or 
+                    filename in ('.', '..') or 
+                    '..' in filename or 
+                    filename.startswith('.') or 
+                    filename.startswith('-') or 
+                    filename.endswith('.') or 
+                    filename.endswith('-') or 
+                    not re.match(r'^[a-zA-Z0-9_\-\.]+$', filename)):
+                    client_sock.sendall(b"ERROR INVALID_FILENAME\n")
+                    continue
+                
                 filepath = os.path.join(SHARED_FILES_DIR, filename)
                 
                 if not os.path.exists(filepath) or not os.path.isfile(filepath):
@@ -255,6 +275,18 @@ def handle_client(client_sock: socket.socket, addr: Tuple[str, int]) -> None:
                     continue
                 
                 filename = os.path.basename(parts[1])
+                import re
+                if (not filename or 
+                    filename in ('.', '..') or 
+                    '..' in filename or 
+                    filename.startswith('.') or 
+                    filename.startswith('-') or 
+                    filename.endswith('.') or 
+                    filename.endswith('-') or 
+                    not re.match(r'^[a-zA-Z0-9_\-\.]+$', filename)):
+                    client_sock.sendall(b"ERROR INVALID_FILENAME\n")
+                    continue
+                
                 filepath = os.path.join(SHARED_FILES_DIR, filename)
                 
                 if not os.path.exists(filepath) or not os.path.isfile(filepath):
@@ -299,6 +331,12 @@ def handle_client(client_sock: socket.socket, addr: Tuple[str, int]) -> None:
                 
                 old_name = os.path.basename(parts[1])
                 new_name = os.path.basename(parts[2])
+                
+                import re
+                if (not old_name or old_name in ('.', '..') or '..' in old_name or old_name.startswith('.') or old_name.startswith('-') or old_name.endswith('.') or old_name.endswith('-') or not re.match(r'^[a-zA-Z0-9_\-\.]+$', old_name) or
+                    not new_name or new_name in ('.', '..') or '..' in new_name or new_name.startswith('.') or new_name.startswith('-') or new_name.endswith('.') or new_name.endswith('-') or not re.match(r'^[a-zA-Z0-9_\-\.]+$', new_name)):
+                    client_sock.sendall(b"ERROR INVALID_FILENAME\n")
+                    continue
                 
                 old_path = os.path.join(SHARED_FILES_DIR, old_name)
                 new_path = os.path.join(SHARED_FILES_DIR, new_name)

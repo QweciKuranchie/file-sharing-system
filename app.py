@@ -158,23 +158,30 @@ def get_file_type(filename):
 
 import time
 
-_LAST_HEALTH_CHECK_TIME = 0
-_HEALTH_CHECK_CACHE_DURATION = 5.0 # cache health check for 5 seconds
-
 @app.before_request
 def check_primary_health():
-    global PRIMARY_DOWN, _LAST_HEALTH_CHECK_TIME
-    # Only run health checks for non-static, non-auth endpoints
-    if not request.endpoint or request.endpoint in ('static', 'login', 'register', 'logout', 'index'):
-        g.primary_down = PRIMARY_DOWN  # fallback or default
+    global PRIMARY_DOWN
+    # Only run health checks for non-static endpoints
+    if not request.endpoint or request.endpoint == 'static':
+        g.primary_down = PRIMARY_DOWN or session.get('primary_down', False)
         return
-    now = time.time()
-    if now - _LAST_HEALTH_CHECK_TIME > _HEALTH_CHECK_CACHE_DURATION:
-        # Use a short 1-second timeout so it doesn't block the caller too long
-        PRIMARY_DOWN = not ping_server(PRIMARY_HOST, PRIMARY_PORT, timeout=1.0)
-        _LAST_HEALTH_CHECK_TIME = now
-        
+    PRIMARY_DOWN = not ping_server(PRIMARY_HOST, PRIMARY_PORT, timeout=5.0)
+    session['primary_down'] = PRIMARY_DOWN
     g.primary_down = PRIMARY_DOWN
+
+@app.after_request
+def add_failover_header(response):
+    try:
+        is_down = getattr(g, 'primary_down', PRIMARY_DOWN or session.get('primary_down', False))
+    except Exception:
+        is_down = PRIMARY_DOWN
+    if response.headers.get('X-Primary-Down') == 'true' or response.headers.get('X-Failover-Triggered') == 'true':
+        is_down = True
+    response.headers['X-Primary-Down'] = 'true' if is_down else 'false'
+    if is_down:
+        response.headers['X-Failover-Triggered'] = 'true'
+    response.set_cookie('primary_down', 'true' if is_down else 'false', path='/', samesite='Lax')
+    return response
 
 
 @app.before_request
@@ -275,7 +282,9 @@ def logout():
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    files = auth.get_all_files()
+    search = request.args.get('search', '').strip()
+    file_type = request.args.get('type', '').strip()
+    files = auth.get_filtered_files(search=search, file_type=file_type)
     return render_template('dashboard.html', active_page='dashboard', files=files)
 
 @app.route('/upload', methods=['POST'])
@@ -297,8 +306,35 @@ def upload_file():
     original_name = file.filename
     if not original_name:
         return jsonify({"status": "error", "message": "No file selected"}), 400
-    safe_filename = os.path.basename(original_name.replace(" ", "_"))
-    if not safe_filename or safe_filename in ('.', '..'):
+    
+    # Block path traversal and null bytes; allow all other common filename characters.
+    # original_name is only stored as a display label — safe_filename (below) is what
+    # actually touches the filesystem and is strictly validated separately.
+    import re
+    if ('\x00' in original_name or
+        '..' in original_name or
+        '/' in original_name or
+        '\\' in original_name or
+        not re.match(r'^[a-zA-Z0-9_\-\.\(\)\[\]\{\} ,+!@#&\'\"=~$%^]+$', original_name)):
+        return jsonify({"status": "error", "message": "Invalid filename characters"}), 400
+        
+    # Build a safe filename for disk/TCP: replace every unsafe character with '_',
+    # collapse runs of underscores, and strip leading/trailing underscores or hyphens.
+    # The original_name is preserved as the display label in the DB.
+    _stem, _ext = os.path.splitext(os.path.basename(original_name))
+    _ext = re.sub(r'[^a-zA-Z0-9]', '', _ext)          # keep only alnum in extension
+    _stem = re.sub(r'[^a-zA-Z0-9_\-]', '_', _stem)    # replace unsafe chars in stem
+    _stem = re.sub(r'_+', '_', _stem).strip('_-')      # collapse/strip underscores
+    safe_filename = (_stem + ('.' + _ext if _ext else '')) if _stem else ''
+
+    if (not safe_filename or
+        safe_filename in ('.', '..') or
+        '..' in safe_filename or
+        safe_filename.startswith('.') or
+        safe_filename.startswith('-') or
+        safe_filename.endswith('.') or
+        safe_filename.endswith('-') or
+        not re.match(r'^[a-zA-Z0-9_\-\.]+$', safe_filename)):
         return jsonify({"status": "error", "message": "Invalid filename"}), 400
         
     file_data = file.read()
@@ -413,6 +449,7 @@ def download_file(filename):
     host = REPLICA_HOST if g.primary_down else PRIMARY_HOST
     port = REPLICA_PORT if g.primary_down else PRIMARY_PORT
     
+    failover_triggered = False
     s = None
     try:
         s = connect_and_authenticate(host, port, timeout=5)
@@ -447,6 +484,8 @@ def download_file(filename):
             g.primary_down = True
             global PRIMARY_DOWN
             PRIMARY_DOWN = True
+            session['primary_down'] = True
+            failover_triggered = True
             
             host = REPLICA_HOST
             port = REPLICA_PORT
@@ -462,12 +501,28 @@ def download_file(filename):
                 if not resp_line.startswith("OK "):
                     s.close()
                     if "FILE_NOT_FOUND" in resp_line:
-                        return jsonify({"status": "error", "message": "File not found on any server"}), 404
+                        response = jsonify({"status": "error", "message": "File not found on any server"})
+                        response.headers['X-Primary-Down'] = 'true'
+                        response.headers['X-Failover-Triggered'] = 'true'
+                        response.set_cookie('primary_down', 'true', path='/', samesite='Lax')
+                        return response, 404
                     if "INVALID_FILENAME" in resp_line:
-                        return jsonify({"status": "error", "message": "Invalid filename"}), 400
+                        response = jsonify({"status": "error", "message": "Invalid filename"})
+                        response.headers['X-Primary-Down'] = 'true'
+                        response.headers['X-Failover-Triggered'] = 'true'
+                        response.set_cookie('primary_down', 'true', path='/', samesite='Lax')
+                        return response, 400
                     if "INVALID_COMMAND" in resp_line:
-                        return jsonify({"status": "error", "message": "Invalid command"}), 400
-                    return jsonify({"status": "error", "message": f"Download failed: {resp_line}"}), 500
+                        response = jsonify({"status": "error", "message": "Invalid command"})
+                        response.headers['X-Primary-Down'] = 'true'
+                        response.headers['X-Failover-Triggered'] = 'true'
+                        response.set_cookie('primary_down', 'true', path='/', samesite='Lax')
+                        return response, 400
+                    response = jsonify({"status": "error", "message": f"Download failed: {resp_line}"})
+                    response.headers['X-Primary-Down'] = 'true'
+                    response.headers['X-Failover-Triggered'] = 'true'
+                    response.set_cookie('primary_down', 'true', path='/', samesite='Lax')
+                    return response, 500
                     
                 parts = resp_line.split()
                 file_size = int(parts[1])
@@ -478,9 +533,18 @@ def download_file(filename):
                         s.close()
                     except Exception:
                         pass
-                return jsonify({"status": "error", "message": "Failed to connect to file server."}), 500
+                response = jsonify({"status": "error", "message": "Failed to connect to file server."})
+                response.headers['X-Primary-Down'] = 'true'
+                response.headers['X-Failover-Triggered'] = 'true'
+                response.set_cookie('primary_down', 'true', path='/', samesite='Lax')
+                return response, 500
         else:
-            return jsonify({"status": "error", "message": "Failed to connect to file server."}), 500
+            response = jsonify({"status": "error", "message": "Failed to connect to file server."})
+            if g.primary_down:
+                response.headers['X-Primary-Down'] = 'true'
+                response.headers['X-Failover-Triggered'] = 'true'
+                response.set_cookie('primary_down', 'true', path='/', samesite='Lax')
+            return response, 500
         
     def generate_bytes(sock, size):
         try:
@@ -506,7 +570,14 @@ def download_file(filename):
         'Content-Disposition': f'attachment; filename="{file_record["original_name"]}"',
         'Content-Length': str(file_size)
     }
-    return Response(generate_bytes(s, file_size), headers=headers)
+    if failover_triggered or g.primary_down:
+        headers['X-Primary-Down'] = 'true'
+        headers['X-Failover-Triggered'] = 'true'
+        
+    response = Response(generate_bytes(s, file_size), headers=headers)
+    if failover_triggered or g.primary_down:
+        response.set_cookie('primary_down', 'true', path='/', samesite='Lax')
+    return response
 
 @app.route('/delete/<filename>', methods=['POST'])
 @login_required
@@ -604,7 +675,15 @@ def rename_file(filename):
         return jsonify({"status": "error", "message": "New filename is required"}), 400
         
     new_name = os.path.basename(new_name.replace(" ", "_"))
-    if not new_name or new_name in ('.', '..'):
+    import re
+    if (not new_name or 
+        new_name in ('.', '..') or 
+        '..' in new_name or 
+        new_name.startswith('.') or 
+        new_name.startswith('-') or 
+        new_name.endswith('.') or 
+        new_name.endswith('-') or 
+        not re.match(r'^[a-zA-Z0-9_\-\.]+$', new_name)):
         return jsonify({"status": "error", "message": "Invalid filename"}), 400
     
     existing_file = auth.get_file_by_name(new_name)
@@ -652,25 +731,66 @@ def rename_file(filename):
     except Exception as e:
         return jsonify({"status": "error", "message": "Rename failed"}), 500
 
+@app.route('/quota')
+@login_required
+def get_quota():
+    user = auth.get_user_by_id(g.user['id'])
+    if not user:
+        return jsonify({"status": "error", "message": "User not found"}), 404
+    used = user.get('quota_used_bytes', 0) or 0
+    limit = user.get('quota_limit_bytes', 0) or 0
+    if limit <= 0:
+        limit = 52428800  # 50 MB default
+    pct = min(100, round(used / limit * 100))
+    return jsonify({
+        "used": used,
+        "limit": limit,
+        "used_formatted": format_size(used),
+        "limit_formatted": format_size(limit),
+        "pct": pct
+    })
+
 @app.route('/files')
 @login_required
 def list_files():
-    files = auth.get_all_files()
+    search = request.args.get('search', '').strip()
+    file_type = request.args.get('type', '').strip()
+    files = auth.get_filtered_files(search=search, file_type=file_type)
     formatted_files = []
     for f in files:
         formatted_files.append({
             "name": f['filename'],
+            "original_name": f['original_name'],
             "size": format_size(f['file_size_bytes']),
             "type": f['file_type'],
             "uploaded": f['uploaded_at'].split('T')[0] if 'T' in f['uploaded_at'] else f['uploaded_at'],
-            "owner": f['owner_username']
+            "owner": f['owner_username'],
+            "owner_id": f['owner_id']
         })
     return jsonify({"files": formatted_files})
 
 @app.route('/profile')
 @login_required
 def profile():
-    return render_template('profile.html', active_page='profile')
+    user = auth.get_user_by_id(g.user['id'])
+    if not user:
+        flash("User not found.", "error")
+        return redirect(url_for('dashboard'))
+        
+    member_since = "Unknown"
+    created_at_str = user.get('created_at')
+    if created_at_str:
+        try:
+            clean_ts = created_at_str.replace('Z', '')
+            if 'T' in clean_ts:
+                dt = datetime.datetime.fromisoformat(clean_ts)
+            else:
+                dt = datetime.datetime.strptime(clean_ts, "%Y-%m-%d %H:%M:%S")
+            member_since = dt.strftime("%B %d, %Y")
+        except Exception:
+            member_since = created_at_str
+            
+    return render_template('profile.html', active_page='profile', user=user, member_since=member_since)
 
 if __name__ == '__main__':
     # Default Flask port is 5000

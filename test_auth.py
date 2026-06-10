@@ -29,11 +29,14 @@ from auth import (                            # noqa: E402
     login_user,
     validate_token,
     check_quota,
+    reserve_quota,
+    release_quota,
     update_quota,
     DuplicateUsernameError,
     DuplicateEmailError,
     InvalidCredentialsError,
     TokenError,
+    AuthError,
 )
 
 
@@ -325,3 +328,396 @@ class TestUpdateQuota:
         ).fetchone()
         conn.close()
         assert row["quota_used_bytes"] == 6_000_000
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-8  reserve_quota — atomic check-and-increment
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestReserveQuota:
+    def test_reserve_success(self):
+        """reserve_quota returns True and increments quota_used_bytes."""
+        user = _register_default_user()
+        result = reserve_quota(user["id"], 1_000_000)
+        assert result is True
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT quota_used_bytes FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()
+        conn.close()
+        assert row["quota_used_bytes"] == 1_000_000
+
+    def test_reserve_exactly_at_limit(self):
+        """Reserving the full quota limit in one shot should succeed."""
+        user = _register_default_user()
+        result = reserve_quota(user["id"], 52_428_800)  # exactly 50 MB
+        assert result is True
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT quota_used_bytes FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()
+        conn.close()
+        assert row["quota_used_bytes"] == 52_428_800
+
+    def test_reserve_exceeds_quota(self):
+        """reserve_quota returns False and does NOT change quota_used_bytes."""
+        user = _register_default_user()
+        result = reserve_quota(user["id"], 52_428_801)  # 1 byte over
+        assert result is False
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT quota_used_bytes FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()
+        conn.close()
+        assert row["quota_used_bytes"] == 0  # unchanged
+
+    def test_reserve_after_partial_usage_exceeds(self):
+        """reserve_quota fails when remaining space is insufficient."""
+        user = _register_default_user()
+        update_quota(user["id"], 40_000_000)   # pre-fill 40 MB
+        result = reserve_quota(user["id"], 20_000_000)  # needs 20 MB, only 12 left
+        assert result is False
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT quota_used_bytes FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()
+        conn.close()
+        assert row["quota_used_bytes"] == 40_000_000  # still 40 MB, not changed
+
+    def test_reserve_nonexistent_user(self):
+        """reserve_quota returns False for a user that doesn't exist."""
+        result = reserve_quota(9999, 100)
+        assert result is False
+
+    def test_reserve_rollback_on_downstream_failure(self):
+        """
+        Simulate: reserve succeeds, then downstream fails, then release_quota
+        restores the original quota_used_bytes.
+        """
+        user = _register_default_user()
+        file_size = 5_000_000
+
+        reserved = reserve_quota(user["id"], file_size)
+        assert reserved is True
+
+        # Simulate downstream (TCP / DB metadata) failure — call release_quota
+        release_quota(user["id"], file_size)
+
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT quota_used_bytes FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()
+        conn.close()
+        assert row["quota_used_bytes"] == 0  # fully rolled back
+
+    def test_concurrent_reserve_only_one_succeeds_when_near_limit(self):
+        """
+        Simulate two concurrent upload requests against the same user who has
+        only enough quota for one of them.
+
+        Because reserve_quota is a single conditional UPDATE, SQLite's
+        serialised write model guarantees exactly one of the two concurrent
+        calls wins the check-and-increment race.
+        """
+        import threading
+
+        user = _register_default_user()
+        # Leave only 8 MB of quota available.
+        limit = 52_428_800
+        used = limit - 8_000_000
+        update_quota(user["id"], used)
+
+        file_size = 5_000_000   # each request wants 5 MB (8 MB only fits one)
+        results: list[bool] = []
+        lock = threading.Lock()
+
+        def do_reserve():
+            ok = reserve_quota(user["id"], file_size)
+            with lock:
+                results.append(ok)
+
+        t1 = threading.Thread(target=do_reserve)
+        t2 = threading.Thread(target=do_reserve)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        # Exactly one should have succeeded.
+        assert results.count(True) == 1
+        assert results.count(False) == 1
+
+        # DB state: only 5 MB added on top of the pre-filled amount.
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT quota_used_bytes FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()
+        conn.close()
+        assert row["quota_used_bytes"] == used + file_size
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-9  release_quota — atomic rollback decrement
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestReleaseQuota:
+    def test_release_decrements_correctly(self):
+        """release_quota subtracts the reserved amount from quota_used_bytes."""
+        user = _register_default_user()
+        reserve_quota(user["id"], 10_000_000)
+        release_quota(user["id"], 10_000_000)
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT quota_used_bytes FROM users WHERE id = ?", (user["id"],)
+        ).fetchone()
+        conn.close()
+        assert row["quota_used_bytes"] == 0
+
+    def test_release_underflow_raises(self):
+        """release_quota raises ValueError if it would push quota below zero."""
+        user = _register_default_user()  # quota_used_bytes starts at 0
+        with pytest.raises(ValueError, match="below zero"):
+            release_quota(user["id"], 1)  # can't release what was never reserved
+
+    def test_release_nonexistent_user_raises(self):
+        with pytest.raises(ValueError, match="No user found"):
+            release_quota(9999, 100)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AC-10  register_user — IntegrityError regression (concurrency bypass)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestRegisterUserIntegrityError:
+    """
+    Regression: if two signup requests race past the SELECT checks at the
+    same time, the loser hits sqlite3.IntegrityError on INSERT.  Verify that
+    register_user translates that into the module's public exception types
+    rather than letting raw SQLite errors escape.
+    """
+
+    def test_duplicate_username_via_direct_insert_raises_typed_error(self):
+        """Bypass the pre-check SELECTs to simulate the concurrent-insert race."""
+        _register_default_user()  # kwame is now in the DB
+
+        # Manually insert a conflicting row to simulate the concurrent winner.
+        # Then call register_user with the same username — the SELECT pre-check
+        # will fire, but we also want to verify the IntegrityError path fires
+        # when the SELECT is skipped entirely.
+        import sqlite3 as _sqlite3
+        conn = get_connection()
+        # Bypass register_user’s SELECT checks by inserting directly.
+        # This puts a second row with the same username into the DB.
+        # Then we assert that register_user still raises DuplicateUsernameError
+        # (i.e., the IntegrityError handler works).
+        #
+        # We patch the SELECT to return nothing so the pre-check passes, and
+        # only the INSERT itself triggers IntegrityError.
+        from unittest.mock import patch, MagicMock
+
+        fake_none = MagicMock()
+        fake_none.fetchone.return_value = None  # fool the pre-check SELECTs
+
+        original_execute = conn.__class__.execute
+        call_count = [0]
+
+        def patched_execute(self_conn, sql, params=()):
+            call_count[0] += 1
+            # Let the INSERT go through to the real DB — which will
+            # raise IntegrityError because 'kwame' already exists.
+            return original_execute(self_conn, sql, params)
+
+        with patch("auth.get_connection") as mock_conn_factory:
+            real_conn = get_connection()
+            mock_conn_factory.return_value = real_conn
+
+            # Patch execute on the real connection to skip the SELECT checks.
+            original_real_execute = real_conn.execute
+            select_calls = [0]
+
+            def selective_execute(sql, params=()):
+                stripped = sql.strip().upper()
+                if stripped.startswith("SELECT") and "FROM USERS" in stripped:
+                    select_calls[0] += 1
+                    if select_calls[0] <= 2:  # skip the two pre-check SELECTs
+                        return fake_none
+                return original_real_execute(sql, params)
+
+            real_conn.execute = selective_execute  # type: ignore[method-assign]
+
+            with pytest.raises(DuplicateUsernameError):
+                register_user("kwame", "other@example.com", "pass123")
+
+    def test_duplicate_email_via_direct_insert_raises_typed_error(self):
+        """Same race condition for email uniqueness."""
+        _register_default_user()  # kwame@example.com is now in the DB
+
+        from unittest.mock import patch, MagicMock
+
+        fake_none = MagicMock()
+        fake_none.fetchone.return_value = None
+
+        with patch("auth.get_connection") as mock_conn_factory:
+            real_conn = get_connection()
+            mock_conn_factory.return_value = real_conn
+
+            original_real_execute = real_conn.execute
+            select_calls = [0]
+
+            def selective_execute(sql, params=()):
+                stripped = sql.strip().upper()
+                if stripped.startswith("SELECT") and "FROM USERS" in stripped:
+                    select_calls[0] += 1
+                    if select_calls[0] <= 2:
+                        return fake_none
+                return original_real_execute(sql, params)
+
+            real_conn.execute = selective_execute  # type: ignore[method-assign]
+
+            with pytest.raises((DuplicateEmailError, DuplicateUsernameError, AuthError)):
+                register_user("newuser", "kwame@example.com", "pass123")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Timestamp Standardization and Migration tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+import re
+from database import normalize_timestamp, normalize_existing_timestamps, add_file
+
+class TestTimestampStandardization:
+    def test_timestamp_format_on_registration(self):
+        user = register_user("newuser", "newuser@example.com", "password123")
+        assert "created_at" in user
+        # Matches format YYYY-MM-DDTHH:MM:SSZ
+        assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", user["created_at"]) is not None
+
+    def test_timestamp_format_on_add_file(self):
+        user = register_user("newuser2", "newuser2@example.com", "password123")
+        add_file("test_file.txt", "test_file.txt", "text/plain", 100, user["id"])
+        
+        conn = get_connection()
+        row = conn.execute("SELECT uploaded_at FROM files WHERE filename = 'test_file.txt'").fetchone()
+        conn.close()
+        
+        assert row is not None
+        assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", row["uploaded_at"]) is not None
+
+    def test_normalize_timestamp_helper(self):
+        # space-separated SQLite format
+        assert normalize_timestamp("2026-06-09 11:20:30") == "2026-06-09T11:20:30Z"
+        # ISO format with +00:00 and microseconds
+        assert normalize_timestamp("2026-06-09T11:20:30.123456+00:00") == "2026-06-09T11:20:30Z"
+        # Standard format should remain untouched
+        assert normalize_timestamp("2026-06-09T11:20:30Z") == "2026-06-09T11:20:30Z"
+        # ISO format with +02:00 (timezone offset conversion)
+        assert normalize_timestamp("2026-06-09T13:20:30+02:00") == "2026-06-09T11:20:30Z"
+
+    def test_normalize_existing_timestamps_migration(self):
+        # We manually insert rows with different timestamp formats bypassing validators
+        conn = get_connection()
+        
+        # Clear out tables
+        with conn:
+            conn.execute("DELETE FROM files")
+            conn.execute("DELETE FROM users")
+            
+            # Insert direct user rows with raw SQL
+            conn.execute(
+                """
+                INSERT INTO users (id, username, email, password_hash, created_at)
+                VALUES (1, 'userA', 'usera@example.com', 'hash', '2026-06-09 11:20:30')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO users (id, username, email, password_hash, created_at)
+                VALUES (2, 'userB', 'userb@example.com', 'hash', '2026-06-09T11:20:30.123456+00:00')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO users (id, username, email, password_hash, created_at)
+                VALUES (3, 'userC', 'userc@example.com', 'hash', '2026-06-09T11:20:30Z')
+                """
+            )
+            
+            # Insert direct file rows with raw SQL
+            conn.execute(
+                """
+                INSERT INTO files (id, filename, original_name, file_type, file_size_bytes, uploaded_at, owner_id)
+                VALUES (1, 'file1.txt', 'file1.txt', 'text/plain', 10, '2026-06-09 11:20:30', 1)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO files (id, filename, original_name, file_type, file_size_bytes, uploaded_at, owner_id)
+                VALUES (2, 'file2.txt', 'file2.txt', 'text/plain', 20, '2026-06-09T11:20:30.123456+00:00', 2)
+                """
+            )
+        conn.close()
+        
+        # Run normalization function
+        normalize_existing_timestamps()
+        
+        # Verify
+        conn = get_connection()
+        users = conn.execute("SELECT id, created_at FROM users ORDER BY id").fetchall()
+        for u in users:
+            assert u["created_at"] == "2026-06-09T11:20:30Z"
+            
+        files = conn.execute("SELECT id, uploaded_at FROM files ORDER BY id").fetchall()
+        for f in files:
+            assert f["uploaded_at"] == "2026-06-09T11:20:30Z"
+            
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Primary Server Validation tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+from primary_server import handle_client
+from config import SHARED_FILES_DIR
+
+class MockSocket:
+    def __init__(self, command: bytes):
+        self.sent_data = bytearray()
+        self.recv_data = command
+        self.closed = False
+
+    def recv(self, bufsize):
+        if not self.recv_data:
+            return b""
+        chunk = self.recv_data[:bufsize]
+        self.recv_data = self.recv_data[bufsize:]
+        return chunk
+
+    def sendall(self, data):
+        self.sent_data.extend(data)
+
+    def close(self):
+        self.closed = True
+
+    def settimeout(self, timeout):
+        pass
+
+class TestPrimaryServer:
+    def test_negative_upload_size(self):
+        # Clean up any potential files
+        target_file = os.path.join(SHARED_FILES_DIR, "negative_test.txt")
+        if os.path.exists(target_file):
+            try:
+                os.remove(target_file)
+            except OSError:
+                pass
+            
+        sock = MockSocket(b"UPLOAD negative_test.txt -50\n")
+        handle_client(sock, ("127.0.0.1", 12345))
+        
+        # Verify response contains error
+        assert b"ERROR" in sock.sent_data
+        # Verify no file is created
+        assert not os.path.exists(target_file)
+
+

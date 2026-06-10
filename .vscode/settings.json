@@ -1,0 +1,11 @@
+{
+    "python.defaultInterpreterPath": "c:\\Users\\YAYRA\\Desktop\\ndp project\\file-sharing-system\\.venv\\Scripts\\python.exe",
+    "python.analysis.extraPaths": [
+        "c:\\Users\\YAYRA\\Desktop\\ndp project\\file-sharing-system\\.venv\\Lib\\site-packages"
+    ],
+    "python.envFile": "${workspaceFolder}/.env",
+    "python.analysis.venvPath": "c:\\Users\\YAYRA\\Desktop\\ndp project\\file-sharing-system",
+    "python.analysis.venvFolders": [".venv"],
+    "python.terminal.activateEnvironment": true,
+    "python.analysis.useLibraryCodeForTypes": true
+}

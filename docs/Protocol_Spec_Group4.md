@@ -274,6 +274,20 @@ ERROR <error_message>\n
 
 ### 4.3 Commands
 
+#### AUTH
+
+| Field | Value |
+|-------|-------|
+| Purpose | Authenticate the connection before accepting any further commands (enforced on all connections) |
+| Request | `AUTH <tcp_secret>` |
+| Flow | 1. Client connects → 2. Client sends `AUTH <secret>` (either `TCP_CLIENT_SECRET` or `TCP_REPLICATION_SECRET`) → 3. Server validates, identifies role, and responds |
+| Success Response | `OK AUTHENTICATED` |
+| Failure Response | `ERROR UNAUTHORIZED` (Connection is immediately closed) |
+| Roles | - **Client Role** (using `TCP_CLIENT_SECRET`): Full access on Primary; Read-only access on Replica.<br>- **Replication Role** (using `TCP_REPLICATION_SECRET`): Full access on both Primary and Replica (used by primary replication module to sync files/rename/delete). |
+| Example | `AUTH default-test-client-secret-12345` |
+
+---
+
 #### UPLOAD
 
 | Field | Value |
@@ -369,7 +383,7 @@ ERROR <error_message>\n
 | `ERROR FILE_NOT_FOUND` | TCP | Requested file does not exist on the server | Show error message to user |
 | `ERROR FILE_TOO_LARGE` | HTTP | Uploaded file exceeds 10MB | Prompt user to choose a smaller file |
 | `ERROR QUOTA_EXCEEDED` | HTTP | Upload would exceed user's storage quota | Notify user; show current usage |
-| `ERROR REPLICATION_FAILED` | TCP | Primary could not sync file to replica | Log warning; file still saved on primary |
+| `ERROR REPLICATION_FAILED` | TCP | Primary could not sync file to replica, or deletion/rename propagation failed (or was ambiguous). File local state is rolled back. | Log warning; operation failed to complete |
 | `ERROR DELETE_FAILED` | TCP | File could not be deleted from disk | Show error; advise retry |
 | `ERROR RENAME_FAILED` | TCP | File could not be renamed | Show error; check for name conflicts |
 | `ERROR CANNOT_LIST` | TCP | Server could not read the storage directory | Show error; advise server check |
@@ -378,6 +392,8 @@ ERROR <error_message>\n
 | `ERROR INVALID_FILENAME` | TCP | Filename contains illegal characters | Notify user to rename file |
 | `ERROR ACCESS_DENIED` | HTTP | User does not have permission for this file | Show access denied message |
 | `ERROR CONNECTION_REFUSED` | TCP | Target server is not running | Attempt failover to replica |
+| `ERROR UNAUTHORIZED` | TCP | TCP client failed to authenticate with the configured secret | Ensure correct secret is configured |
+| `ERROR WRITE_NOT_ALLOWED` | TCP | Mutating command sent to Replica Server by a client with client role | Reject write operation; replica remains read-only |
 
 ---
 
@@ -417,3 +433,4 @@ The renamed filename is returned to Flask in the `UPLOAD` success response (`OK 
 | Version | Date | Author | Description |
 |---------|------|--------|-------------|
 | 1.0 | June 2026 | Group 4 | Initial version |
+| 1.1 | June 2026 | Group 4 | Added role-based TCP secrets, write-restrictions on replica, download auth, and rollback on ambiguous propagation |

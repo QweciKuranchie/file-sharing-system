@@ -80,6 +80,7 @@ Set environment variables to override defaults, or edit [`config.py`](config.py)
 | `REPLICA_HOST` | `127.0.0.1` | Replica server IP address |
 | `REPLICA_PORT` | `9001` | Replica server TCP port |
 | `FLASK_PORT` | `5000` | Flask HTTP port |
+| `TCP_SHARED_SECRET` | `default-tcp-shared-secret-key-12345` | Shared secret for internal TCP authentication |
 
 ### 3. Start the Servers
 

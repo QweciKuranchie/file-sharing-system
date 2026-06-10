@@ -17,8 +17,11 @@ from database import init_db
 from app import app
 
 class SocketMock:
-    def __init__(self, response_bytes, raise_on_connect=None):
-        self.response_bytes = response_bytes
+    def __init__(self, response_bytes, raise_on_connect=None, skip_auth_prefix=False):
+        if not skip_auth_prefix and not raise_on_connect:
+            self.response_bytes = b"OK AUTHENTICATED\n" + response_bytes
+        else:
+            self.response_bytes = response_bytes
         self.raise_on_connect = raise_on_connect
         self.index = 0
         self.sent_data = bytearray()
@@ -48,13 +51,18 @@ class SocketMock:
 
 
 class DelayedBodySocketMock:
-    def __init__(self, response_bytes):
-        self.response_bytes = response_bytes
+    def __init__(self, response_bytes, skip_auth_prefix=False):
+        self.skip_auth_prefix = skip_auth_prefix
+        if not skip_auth_prefix:
+            self.response_bytes = b"OK AUTHENTICATED\n" + response_bytes
+        else:
+            self.response_bytes = response_bytes
         self.index = 0
         self.sent_data = bytearray()
         self.closed = False
         self.timeout = None
         self.header_read_done = False
+        self.newlines_seen = 0
 
     def connect(self, addr):
         pass
@@ -76,7 +84,9 @@ class DelayedBodySocketMock:
         chunk = self.response_bytes[self.index : self.index + num_bytes]
         self.index += len(chunk)
         
-        if b'\n' in chunk and not self.header_read_done:
+        self.newlines_seen += chunk.count(b'\n')
+        target_newlines = 1 if self.skip_auth_prefix else 2
+        if self.newlines_seen >= target_newlines and not self.header_read_done:
             self.header_read_done = True
             
         return chunk
@@ -770,6 +780,54 @@ class TestAppRoutes(unittest.TestCase):
         self.assertIn(b"DELETE comp2_file.txt", sock_delete.sent_data)
 
     @patch('app.socket.socket')
+    @patch('auth.add_file')
+    def test_upload_failed_compensating_delete_retains_quota(self, mock_add_file, mock_socket_class):
+        """When add_file raises and the compensating DELETE also fails,
+        quota must NOT be released — the file still exists on disk."""
+        self.client.post('/register', data={
+            'username': 'comp_del_fail',
+            'email': 'comp_del_fail@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'comp_del_fail',
+            'password': 'password123'
+        })
+
+        user_id = auth.login_user('comp_del_fail', 'password123')
+        u_payload = auth.decode_token(user_id)
+        u_id = u_payload['user_id']
+
+        # Verify quota is initially 0
+        user_before = auth.get_user_by_id(u_id)
+        self.assertIsNotNone(user_before)
+        self.assertEqual(user_before['quota_used_bytes'], 0)
+
+        # Set auth.add_file to raise (triggering exception path)
+        mock_add_file.side_effect = Exception("SQLite Database Failure")
+
+        sock_ping = SocketMock(b"OK PONG\n")
+        sock_upload = SocketMock(b"READY\nOK FILE_SAVED comp_del_fail_file.txt\n")
+        # Compensating DELETE fails (connection refused)
+        sock_delete = SocketMock(b"", raise_on_connect=ConnectionRefusedError("Offline"))
+        mock_socket_class.side_effect = [sock_ping, sock_upload, sock_delete]
+
+        data = {
+            'file': (tempfile.SpooledTemporaryFile(), 'comp_del_fail_file.txt')
+        }
+        data['file'][0].write(b"some content")
+        data['file'][0].seek(0)
+
+        response = self.client.post('/upload', data=data, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 500)
+
+        # Quota must NOT be rolled back — file still exists on disk
+        user_after = auth.get_user_by_id(u_id)
+        self.assertIsNotNone(user_after)
+        self.assertEqual(user_after['quota_used_bytes'], 12)  # len(b"some content")
+
+    @patch('app.socket.socket')
     def test_delete_file_not_found(self, mock_socket_class):
         self.client.post('/register', data={
             'username': 'deleter2',
@@ -1361,6 +1419,185 @@ class TestQuotaReservation(unittest.TestCase):
 
         self.assertIn(200, statuses)
         self.assertIn(403, statuses)
+
+    def test_sliding_window_active_vs_idle(self):
+        # 1. Login user to get initial session token
+        self._register_login('sliding_user', 'sliding@example.com')
+        with self.client.session_transaction() as sess:
+            orig_token = sess.get('token')
+        
+        self.assertIsNotNone(orig_token)
+        orig_payload = auth.decode_token(orig_token)
+        
+        # 2. Simulate activity: request dashboard
+        # Make a mock socket response since dashboard calls list/ping
+        with patch('app.socket.socket') as mock_sock:
+            mock_sock.side_effect = [SocketMock(b"OK PONG\n"), SocketMock(b"OK []\n")]
+            response = self.client.get('/dashboard')
+            self.assertEqual(response.status_code, 200)
+        
+        # 3. Check that session token was refreshed/updated
+        with self.client.session_transaction() as sess:
+            refreshed_token = sess.get('token')
+            
+        self.assertIsNotNone(refreshed_token)
+        self.assertNotEqual(orig_token, refreshed_token)
+        
+        refreshed_payload = auth.decode_token(refreshed_token)
+        # Expiry timestamp should have advanced
+        self.assertGreater(refreshed_payload['exp'], orig_payload['exp'])
+
+        # 4. Idle/Expired token: simulate expired token by setting exp to past
+        import jwt as _jwt
+        from datetime import datetime, timezone, timedelta
+        import config
+        
+        expired_payload = {
+            "user_id": orig_payload['user_id'],
+            "username": "sliding_user",
+            "exp": datetime.now(timezone.utc) - timedelta(minutes=5),
+            "iat": datetime.now(timezone.utc) - timedelta(minutes=31),
+        }
+        expired_token = _jwt.encode(
+            expired_payload, config.JWT_SECRET_KEY, algorithm=config.JWT_ALGORITHM
+        )
+        
+        with self.client.session_transaction() as sess:
+            sess['token'] = expired_token
+            
+        # Accessing dashboard should fail auth, clear session, and redirect to /login
+        with patch('app.socket.socket') as mock_sock:
+            mock_sock.side_effect = [SocketMock(b"OK PONG\n")]
+            response = self.client.get('/dashboard')
+            self.assertEqual(response.status_code, 302)
+            self.assertIn('/login', response.headers.get('Location', ''))
+            
+        with self.client.session_transaction() as sess:
+            self.assertNotIn('token', sess)
+
+    def test_auth_validation_status_codes(self):
+        # Missing login fields
+        resp = self.client.post('/login', data={'username': '', 'password': ''})
+        self.assertEqual(resp.status_code, 400)
+        
+        # Invalid credentials
+        resp = self.client.post('/login', data={'username': 'nonexistent', 'password': 'pw'})
+        self.assertEqual(resp.status_code, 200) # aligned with documented login contract (200 OK)
+        
+        # Missing registration fields
+        resp = self.client.post('/register', data={'username': '', 'email': '', 'password': ''})
+        self.assertEqual(resp.status_code, 400)
+        
+        # Passwords mismatch
+        resp = self.client.post('/register', data={
+            'username': 'mismatch', 'email': 'mis@ex.com', 'password': 'p1', 'confirm_password': 'p2'
+        })
+        self.assertEqual(resp.status_code, 400)
+        
+        # Duplicate registration
+        self.client.post('/register', data={
+            'username': 'dup', 'email': 'dup@ex.com', 'password': 'p', 'confirm_password': 'p'
+        })
+        # Try registering same username again
+        resp = self.client.post('/register', data={
+            'username': 'dup', 'email': 'dup2@ex.com', 'password': 'p', 'confirm_password': 'p'
+        })
+        self.assertEqual(resp.status_code, 409)
+        # Try registering same email again
+        resp = self.client.post('/register', data={
+            'username': 'dup2', 'email': 'dup@ex.com', 'password': 'p', 'confirm_password': 'p'
+        })
+        self.assertEqual(resp.status_code, 409)
+
+    @patch('auth.get_user_by_id')
+    def test_load_user_lookup_error_propagation(self, mock_get_user):
+        # Set mock to raise a database exception
+        mock_get_user.side_effect = sqlite3.OperationalError("Database locked or connection failed")
+        
+        # Create a valid session token
+        u_id = self._register_login('infra_fail_user', 'infra_fail@ex.com')
+        
+        # Attempt to access dashboard — the DB failure must NOT be caught/masked by load_user.
+        # It should propagate (raising the error to Flask/unittest runner, causing 500 or error).
+        with patch('app.socket.socket') as mock_sock:
+            mock_sock.side_effect = [SocketMock(b"OK PONG\n")]
+            with self.assertRaises(sqlite3.OperationalError):
+                self.client.get('/dashboard')
+
+    @patch('app.ping_server')
+    def test_auth_routes_responsive_during_outage(self, mock_ping):
+        # When primary server is down, ping_server returns False (offline)
+        mock_ping.return_value = False
+        
+        # Access login page - should load successfully (200 OK) without hanging
+        resp = self.client.get('/login')
+        self.assertEqual(resp.status_code, 200)
+        
+        # Access register page - should load successfully
+        resp = self.client.get('/register')
+        self.assertEqual(resp.status_code, 200)
+        
+        # Logging in should function and succeed even if primary server is offline
+        # (write operations are disabled but login/session itself works)
+        self.client.post('/register', data={
+            'username': 'outage_user',
+            'email': 'outage@ex.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        
+        resp = self.client.post('/login', data={
+            'username': 'outage_user',
+            'password': 'password123'
+        })
+        # Successful login redirects to dashboard (302)
+        self.assertEqual(resp.status_code, 302)
+
+    def test_session_security_configuration(self):
+        # Verify secret_key is not the unsafe default development key
+        self.assertNotEqual(app.secret_key, "super-secret-key-change-in-prod")
+        
+        # Verify session security settings
+        self.assertTrue(app.config.get('SESSION_COOKIE_HTTPONLY'))
+        self.assertEqual(app.config.get('SESSION_COOKIE_SAMESITE'), 'Lax')
+        # Secure flag is boolean (False by default in test env unless configured)
+        self.assertIn(app.config.get('SESSION_COOKIE_SECURE'), (True, False))
+
+    @patch('app.socket.socket')
+    def test_download_auth_validation(self, mock_socket_class):
+        # Register and login a user
+        self.client.post('/register', data={
+            'username': 'auth_fail_downloader',
+            'email': 'afd@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'auth_fail_downloader',
+            'password': 'password123'
+        })
+        
+        user_id = auth.login_user('auth_fail_downloader', 'password123')
+        u_payload = auth.decode_token(user_id)
+        u_id = u_payload['user_id']
+        auth.add_file('auth_fail.txt', 'auth_fail.txt', 'document', 10, u_id)
+        
+        # 1. PING succeeds
+        sock_ping = SocketMock(b"OK PONG\n")
+        # 2. Primary download connection fails auth
+        sock_primary_fail = SocketMock(b"ERROR UNAUTHORIZED\n", skip_auth_prefix=True)
+        # 3. Replica download connection also fails auth
+        sock_replica_fail = SocketMock(b"ERROR UNAUTHORIZED\n", skip_auth_prefix=True)
+        
+        mock_socket_class.side_effect = [sock_ping, sock_primary_fail, sock_replica_fail]
+        
+        response = self.client.get('/download/auth_fail.txt')
+        self.assertEqual(response.status_code, 500)
+        self.assertIn(b"Failed to connect to file server.", response.data)
+        
+        from config import TCP_CLIENT_SECRET
+        expected_auth_cmd = f"AUTH {TCP_CLIENT_SECRET}\n"
+        self.assertTrue(sock_primary_fail.sent_data.startswith(expected_auth_cmd.encode('utf-8')))
 
 
 if __name__ == '__main__':

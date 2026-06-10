@@ -4,9 +4,10 @@ auth.py — Authentication, JWT management, and quota helpers.
 Public API
 ----------
 register_user(username, email, password)  → user row dict
-login_user(username, password)            → JWT token string
-validate_token(token)                     → payload dict  (raises on failure)
-decode_token(token)                       → alias for validate_token
+login_user(identifier, password)          → JWT token string  (username or email)
+validate_token(token)                     → user_id int  (raises on failure)
+decode_token(token)                       → payload dict  (raises on failure)
+refresh_token(token)                      → JWT token string  (raises on failure)
 get_user_by_id(user_id)                   → user row dict or None
 check_quota(user_id, file_size_bytes)     → bool
 reserve_quota(user_id, file_size_bytes)   → bool  (atomic check-and-increment)
@@ -171,13 +172,15 @@ def register_user(username: str, email: str, password: str) -> dict[str, Any]:
 
 # ── Login ─────────────────────────────────────────────────────────────────
 
-def login_user(username: str, password: str) -> str:
+def login_user(identifier: str, password: str) -> str:
     """Authenticate a user and return a signed JWT.
 
     Parameters
     ----------
-    username : str
-        The registered username.
+    identifier : str
+        The registered username or email address.  If the value contains
+        ``@`` it is treated as an email (normalized to lowercase); otherwise
+        it is matched as a username.
     password : str
         The plain-text password to verify.
 
@@ -190,23 +193,32 @@ def login_user(username: str, password: str) -> str:
     Raises
     ------
     InvalidCredentialsError
-        If the username does not exist or the password is wrong.
+        If the identifier does not match any user or the password is wrong.
     """
-    if not username or not password:
+    if not identifier or not password:
         raise InvalidCredentialsError("Username and password are required")
+
+    identifier = identifier.strip()
 
     conn = get_connection()
     try:
-        user = conn.execute(
-            "SELECT id, username, password_hash FROM users WHERE username = ?",
-            (username.strip(),),
-        ).fetchone()
+        if "@" in identifier:
+            # Treat as email — normalise to lowercase for case-insensitive match
+            user = conn.execute(
+                "SELECT id, username, password_hash FROM users WHERE email = ?",
+                (identifier.lower(),),
+            ).fetchone()
+        else:
+            user = conn.execute(
+                "SELECT id, username, password_hash FROM users WHERE username = ?",
+                (identifier,),
+            ).fetchone()
 
         if user is None:
-            raise InvalidCredentialsError("Invalid username or password")
+            raise InvalidCredentialsError("Invalid username/email or password")
 
         if not check_password_hash(user["password_hash"], password):
-            raise InvalidCredentialsError("Invalid username or password")
+            raise InvalidCredentialsError("Invalid username/email or password")
 
         # Build JWT payload
         now = datetime.now(timezone.utc)
@@ -225,8 +237,8 @@ def login_user(username: str, password: str) -> str:
 
 # ── JWT Validation ────────────────────────────────────────────────────────
 
-def validate_token(token: str) -> dict[str, Any]:
-    """Decode and verify a JWT.
+def validate_token(token: str) -> int:
+    """Decode and verify a JWT, returning only the user identifier.
 
     Parameters
     ----------
@@ -235,8 +247,42 @@ def validate_token(token: str) -> dict[str, Any]:
 
     Returns
     -------
+    int
+        The ``user_id`` extracted from the validated payload.
+
+    Raises
+    ------
+    TokenError
+        If the token is expired, tampered with, or otherwise invalid.
+    """
+    try:
+        payload = jwt.decode(
+            token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM]
+        )
+        return payload["user_id"]
+    except jwt.ExpiredSignatureError:
+        raise TokenError("Token has expired — please log in again")
+    except jwt.InvalidTokenError as exc:
+        raise TokenError(f"Invalid token: {exc}")
+
+
+def decode_token(token: str) -> dict[str, Any]:
+    """Decode and verify a JWT, returning the full payload.
+
+    Use this when callers need the complete payload (``user_id``,
+    ``username``, ``exp``, ``iat``).  For callers that only need the
+    user identifier, prefer :func:`validate_token`.
+
+    Parameters
+    ----------
+    token : str
+        The encoded JWT string.
+
+    Returns
+    -------
     dict
-        The decoded payload containing at least ``user_id`` and ``username``.
+        The decoded payload containing ``user_id``, ``username``,
+        ``exp``, and ``iat``.
 
     Raises
     ------
@@ -254,8 +300,29 @@ def validate_token(token: str) -> dict[str, Any]:
         raise TokenError(f"Invalid token: {exc}")
 
 
-# Alias used by app.py
-decode_token = validate_token
+def refresh_token(token: str) -> str:
+    """Decode token and return a new token with extended expiry if valid.
+
+    Parameters
+    ----------
+    token : str
+        The current encoded JWT token.
+
+    Returns
+    -------
+    str
+        A new signed JWT token with updated expiry (30 minutes from now).
+
+    Raises
+    ------
+    TokenError
+        If the token is invalid or expired.
+    """
+    payload = decode_token(token)
+    now = datetime.now(timezone.utc)
+    payload["exp"] = now + timedelta(minutes=JWT_EXPIRY_MINUTES)
+    payload["iat"] = now
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
 
 # ── User lookup ───────────────────────────────────────────────────────────

@@ -150,7 +150,7 @@ def login():
         password = request.form.get('password')
 
         if not username_or_email or not password:
-            flash("Username and password are required.", "error")
+            flash("Invalid username or password.", "error")
             return render_template('login.html', active_page='login')
 
         try:
@@ -159,7 +159,7 @@ def login():
             session['token'] = token
             return redirect(url_for('dashboard'))
         except ValueError as e:
-            flash(str(e), "error")
+            flash("Invalid username or password.", "error")
             
     return render_template('login.html', active_page='login')
 
@@ -184,7 +184,7 @@ def register():
             
         try:
             auth.register_user(username, email, password)
-            flash("Registration successful! Please login.", "success")
+            flash("Account created. Please log in.", "success")
             return redirect(url_for('login'))
         except ValueError as e:
             flash(str(e), "error")
@@ -230,10 +230,10 @@ def upload_file():
     file_size = len(file_data)
     
     if file_size > 10 * 1024 * 1024:
-        return jsonify({"status": "error", "message": "File exceeds 10MB limit"}), 413
+        return jsonify({"status": "error", "message": "File exceeds the 10MB limit."}), 413
         
     if not auth.reserve_quota(g.user['id'], file_size):
-        return jsonify({"status": "error", "message": "Storage quota exceeded"}), 403
+        return jsonify({"status": "error", "message": "Storage quota exceeded. Delete files to free space."}), 403
 
     saved_on_server = False
     saved_name = None
@@ -248,9 +248,15 @@ def upload_file():
             file_type = get_file_type(saved_name)
             auth.add_file(saved_name, original_name, file_type, file_size, g.user['id'])
             
+            if saved_name != original_name:
+                msg = f"File uploaded and replicated successfully — saved as {saved_name}"
+            else:
+                msg = "File uploaded and replicated successfully."
+            flash(msg, "success")
+            
             return jsonify({
                 "status": "success", 
-                "message": "File uploaded and replicated", 
+                "message": msg, 
                 "filename": saved_name
             }), 200
             
@@ -262,9 +268,12 @@ def upload_file():
             file_type = get_file_type(saved_name)
             auth.add_file(saved_name, original_name, file_type, file_size, g.user['id'])
             
+            msg = "File uploaded but replication failed. Replica may be out of sync."
+            flash(msg, "warning")
+            
             return jsonify({
                 "status": "warning", 
-                "message": "Uploaded but replication failed",
+                "message": msg,
                 "filename": saved_name
             }), 207
             
@@ -298,7 +307,7 @@ def upload_file():
         auth.release_quota(g.user['id'], file_size)
         return jsonify({
             "status": "error", 
-            "message": "Upload failed. Try again."
+            "message": "Upload failed. Please try again."
         }), 500
 
 @app.route('/download/<filename>')
@@ -422,7 +431,7 @@ def delete_file(filename):
         return jsonify({"status": "error", "message": "File not found"}), 404
         
     if file_record['owner_id'] != g.user['id']:
-        return jsonify({"status": "error", "message": "You can only delete files you own"}), 403
+        return jsonify({"status": "error", "message": "You can only delete files you own."}), 403
         
     try:
         response = send_tcp_command(PRIMARY_HOST, PRIMARY_PORT, f"DELETE {filename}")
@@ -459,6 +468,8 @@ def delete_file(filename):
                         pass
                 if not cleaned:
                     raise db_err
+            msg = "File deleted from all servers."
+            flash(msg, "success")
             return jsonify({"status": "success", "message": "File deleted from all servers"}), 200
         elif "FILE_NOT_FOUND" in response:
             return jsonify({"status": "error", "message": "File not found"}), 404
@@ -468,10 +479,8 @@ def delete_file(filename):
             return jsonify({"status": "error", "message": "Invalid command"}), 400
         elif "REPLICATION_FAILED" in response:
             return jsonify({"status": "error", "message": "Delete failed due to replication propagation error"}), 500
-        elif "DELETE_FAILED" in response:
-            return jsonify({"status": "error", "message": f"Delete failed: {response}"}), 500
         else:
-            return jsonify({"status": "error", "message": f"Delete failed: {response}"}), 500
+            return jsonify({"status": "error", "message": "Delete failed"}), 500
             
     except Exception as e:
         return jsonify({"status": "error", "message": "Delete failed"}), 500
@@ -490,7 +499,7 @@ def rename_file(filename):
         return jsonify({"status": "error", "message": "File not found"}), 404
         
     if file_record['owner_id'] != g.user['id']:
-        return jsonify({"status": "error", "message": "You can only rename files you own"}), 403
+        return jsonify({"status": "error", "message": "You can only rename files you own."}), 403
         
     new_name = request.form.get('new_name') or request.form.get('new_filename')
     if not new_name and request.is_json:
@@ -522,24 +531,24 @@ def rename_file(filename):
                 except Exception:
                     pass
                 raise db_err
+            msg = f"File renamed to {actual_new_name}"
+            flash(msg + ".", "success")
             return jsonify({
                 "status": "success", 
-                "message": f"File renamed to {actual_new_name}"
+                "message": msg
             }), 200
-        elif "FILE_NOT_FOUND" in response:
-            return jsonify({"status": "error", "message": "File not found"}), 404
         elif "NAME_CONFLICT" in response:
             return jsonify({"status": "error", "message": "A file with that name already exists"}), 409
+        elif "FILE_NOT_FOUND" in response:
+            return jsonify({"status": "error", "message": "File not found"}), 404
         elif "INVALID_FILENAME" in response:
             return jsonify({"status": "error", "message": "Invalid filename"}), 400
         elif "INVALID_COMMAND" in response:
             return jsonify({"status": "error", "message": "Invalid command"}), 400
         elif "REPLICATION_FAILED" in response:
             return jsonify({"status": "error", "message": "Rename failed due to replication propagation error"}), 500
-        elif "RENAME_FAILED" in response:
-            return jsonify({"status": "error", "message": f"Rename failed: {response}"}), 500
         else:
-            return jsonify({"status": "error", "message": f"Rename failed: {response}"}), 500
+            return jsonify({"status": "error", "message": "Rename failed"}), 500
             
     except Exception as e:
         return jsonify({"status": "error", "message": "Rename failed"}), 500

@@ -142,6 +142,37 @@
         height: 100%;
         opacity: 0;
         cursor: pointer;
+        z-index: 10;
+    }
+
+    .drop-zone.disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+        border-color: var(--glass-border) !important;
+        background: rgba(255, 255, 255, 0.01) !important;
+        box-shadow: none !important;
+    }
+
+    .drop-zone.disabled:hover {
+        border-color: var(--glass-border) !important;
+        background: rgba(255, 255, 255, 0.01) !important;
+        box-shadow: none !important;
+    }
+
+    .drop-zone.disabled .drop-zone-icon {
+        color: var(--text-muted) !important;
+        transform: none !important;
+    }
+
+    .drop-zone-input:disabled {
+        cursor: not-allowed;
+    }
+
+    .btn:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+        box-shadow: none !important;
+        transform: none !important;
     }
 
     .selected-file-info {
@@ -560,8 +591,14 @@
             <h1 id="welcome-title">Dashboard</h1>
             <p>Manage your files, upload new content, and sync seamlessly.</p>
         </div>
-        <div style="font-size: 0.85rem; color: var(--text-secondary); text-align: right;" id="user-info-text">
-            Logged in as: <span style="color: var(--accent); font-weight: 600;" id="logged-in-username">{{ g.user.username }}</span>
+        <div style="display: flex; flex-direction: column; align-items: flex-end; gap: 0.75rem;" id="user-info-text">
+            <div style="font-size: 0.85rem; color: var(--text-secondary);">
+                Logged in as: <span style="color: var(--accent); font-weight: 600;" id="logged-in-username">{{ g.user.username }}</span>
+            </div>
+            <button class="btn btn-primary" id="header-upload-btn" style="width: auto; padding: 0.5rem 1rem; font-size: 0.9rem;" {% if g.primary_down %}disabled{% endif %}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 4px; vertical-align: middle;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+                Upload File
+            </button>
         </div>
     </div>
 
@@ -597,11 +634,17 @@
                 </h3>
                 
                 <form id="upload-form">
-                    <div class="drop-zone" id="upload-drop-zone">
+                    <div class="drop-zone {% if g.primary_down %}disabled{% endif %}" id="upload-drop-zone">
                         <svg class="drop-zone-icon" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                             <path d="M12 5v14M5 12h14"></path>
                         </svg>
-                        <span class="drop-zone-prompt">Drag & drop or click to browse</span>
+                        <span class="drop-zone-prompt">
+                            {% if g.primary_down %}
+                                Uploads unavailable (Primary Server Offline)
+                            {% else %}
+                                Drag & drop or click to browse
+                            {% endif %}
+                        </span>
                         <input type="file" name="file" id="file-input" class="drop-zone-input" required {% if g.primary_down %}disabled{% endif %}>
                     </div>
 
@@ -646,8 +689,9 @@
                                 <tr>
                                     <th>Name</th>
                                     <th>Size</th>
-                                    <th>Owner</th>
+                                    <th>Type</th>
                                     <th>Uploaded</th>
+                                    <th>Owner</th>
                                     <th style="text-align: right;">Actions</th>
                                 </tr>
                             </thead>
@@ -678,18 +722,21 @@
                                             </div>
                                         </td>
                                         <td class="file-size-col" id="file-size-{{ file.filename }}">{{ file.file_size_bytes | format_size }}</td>
-                                        <td>
-                                            {% if file.owner_id == g.user.id %}
-                                                <span class="badge badge-owner-you" id="file-owner-badge-{{ file.filename }}">You</span>
-                                            {% else %}
-                                                <span class="owner-tag" id="file-owner-tag-{{ file.filename }}">{{ file.owner_username }}</span>
-                                            {% endif %}
+                                        <td class="file-type-col" id="file-type-{{ file.filename }}">
+                                            {% if file.file_type == 'pdf' %}PDF{% else %}{{ file.file_type|capitalize }}{% endif %}
                                         </td>
                                         <td id="file-uploaded-{{ file.filename }}">
                                             {% if 'T' in file.uploaded_at %}
                                                 {{ file.uploaded_at.split('T')[0] }}
                                             {% else %}
                                                 {{ file.uploaded_at }}
+                                            {% endif %}
+                                        </td>
+                                        <td>
+                                            {% if file.owner_id == g.user.id %}
+                                                <span class="badge badge-owner-you" id="file-owner-badge-{{ file.filename }}">You</span>
+                                            {% else %}
+                                                <span class="owner-tag" id="file-owner-tag-{{ file.filename }}">{{ file.owner_username }}</span>
                                             {% endif %}
                                         </td>
                                         <td>
@@ -701,11 +748,18 @@
                                                     <button type="button" class="action-button btn-rename" onclick="openRenameModal('{{ file.filename }}', '{{ file.original_name }}')" title="Rename File" id="rename-btn-{{ file.filename }}" {% if g.primary_down %}disabled{% endif %}>
                                                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
                                                     </button>
-                                                    <button type="button" class="action-button btn-delete" onclick="openDeleteModal('{{ file.filename }}', '{{ file.original_name }}')" title="Delete File" id="delete-btn-{{ file.filename }}" {% if g.primary_down %}disabled{% endif %}>
+                                                    <button type="button" class="action-button btn-delete" onclick="showInlineDeletePrompt('{{ file.filename }}')" title="Delete File" id="delete-btn-{{ file.filename }}" {% if g.primary_down %}disabled{% endif %}>
                                                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
                                                     </button>
                                                 {% endif %}
                                             </div>
+                                            {% if file.owner_id == g.user.id %}
+                                                <div class="delete-confirm-inline" id="delete-confirm-{{ file.filename }}" style="display: none; align-items: center; justify-content: flex-end; gap: 0.5rem; white-space: nowrap;">
+                                                    <span style="font-size: 0.8rem; color: var(--danger); margin-right: 0.25rem;">Delete?</span>
+                                                    <button type="button" class="action-button btn-delete" style="width: auto; height: 28px; padding: 0 8px; font-size: 0.8rem; font-weight: 600;" onclick="executeInlineDelete('{{ file.filename }}')" id="confirm-delete-{{ file.filename }}">Confirm</button>
+                                                    <button type="button" class="action-button btn-secondary" style="width: auto; height: 28px; padding: 0 8px; font-size: 0.8rem; font-weight: 600;" onclick="cancelInlineDelete('{{ file.filename }}')" id="cancel-delete-{{ file.filename }}">Cancel</button>
+                                                </div>
+                                            {% endif %}
                                         </td>
                                     </tr>
                                 {% endfor %}
@@ -717,7 +771,7 @@
                                 <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
                                 <polyline points="14 2 14 8 20 8"></polyline>
                             </svg>
-                            <p>No files uploaded yet.</p>
+                            <p>No files yet. Upload your first file.</p>
                         </div>
                     {% endif %}
                 </div>
@@ -743,6 +797,7 @@
                 <div class="form-group" style="margin-bottom: 0;" id="rename-form-group">
                     <label for="new-filename-input" class="form-label">New Filename</label>
                     <input type="text" id="new-filename-input" name="new_name" class="form-input" required autocomplete="off">
+                    <div class="error-message" id="rename-error-msg" style="display: none; color: var(--danger); font-size: 0.85rem; margin-top: 0.5rem; font-weight: 500;"></div>
                 </div>
             </div>
             <div class="modal-footer" id="rename-modal-footer">
@@ -774,12 +829,11 @@
 </div>
 
 <script>
-    // Global State
-    let activeDeleteFilename = null;
-
     // Helper: Dynamic Alerts
     function showDynamicAlert(message, type) {
-        const container = document.getElementById('dynamic-alerts-container');
+        const container = document.getElementById('global-alerts-container');
+        if (!container) return;
+        
         const alertDiv = document.createElement('div');
         alertDiv.className = `alert alert-${type === 'error' ? 'danger' : type}`;
         alertDiv.role = 'alert';
@@ -798,8 +852,8 @@
         setTimeout(() => {
             alertDiv.style.opacity = '0';
             alertDiv.style.transform = 'translateY(-10px)';
-            alertDiv.style.transition = 'all 0.3s ease';
-            setTimeout(() => alertDiv.remove(), 300);
+            alertDiv.style.transition = 'all 0.5s ease';
+            setTimeout(() => alertDiv.remove(), 500);
         }, 5000);
     }
 
@@ -808,6 +862,7 @@
     const dropZone = document.getElementById('upload-drop-zone');
     const preview = document.getElementById('selected-file-preview');
     const previewName = document.getElementById('selected-file-name');
+    const uploadForm = document.getElementById('upload-form');
 
     if (fileInput && dropZone) {
         fileInput.addEventListener('change', () => {
@@ -816,11 +871,20 @@
             }
         });
 
+        // Click event to trigger file explorer
+        dropZone.addEventListener('click', (e) => {
+            if (e.target !== fileInput && !fileInput.disabled) {
+                fileInput.click();
+            }
+        });
+
         // Drag events
         ['dragenter', 'dragover'].forEach(eventName => {
             dropZone.addEventListener(eventName, (e) => {
                 e.preventDefault();
-                dropZone.classList.add('drag-over');
+                if (!fileInput.disabled) {
+                    dropZone.classList.add('drag-over');
+                }
             }, false);
         });
 
@@ -832,12 +896,21 @@
         });
 
         dropZone.addEventListener('drop', (e) => {
+            if (fileInput.disabled) return;
             const dt = e.dataTransfer;
             const files = dt.files;
             if (files.length > 0) {
                 fileInput.files = files;
                 updateFilePreview(files[0]);
             }
+        });
+    }
+
+    // Auto-upload when selecting via header button
+    const headerUploadBtn = document.getElementById('header-upload-btn');
+    if (headerUploadBtn && fileInput) {
+        headerUploadBtn.addEventListener('click', () => {
+            fileInput.click();
         });
     }
 
@@ -856,7 +929,6 @@
     }
 
     // --- AJAX: Upload File ---
-    const uploadForm = document.getElementById('upload-form');
     const progressContainer = document.getElementById('upload-progress-container');
     const progressBarFill = document.getElementById('upload-progress-bar-fill');
     const progressStatus = document.getElementById('upload-status-text');
@@ -873,7 +945,8 @@
             formData.append('file', file);
 
             // UI feedback
-            uploadBtn.disabled = true;
+            if (uploadBtn) uploadBtn.disabled = true;
+            if (headerUploadBtn) headerUploadBtn.disabled = true;
             progressContainer.style.display = 'block';
             progressBarFill.style.width = '0%';
             progressPct.textContent = '0%';
@@ -909,14 +982,16 @@
                     setTimeout(() => location.reload(), 1500);
                 } else {
                     showDynamicAlert(response.message || 'Upload failed.', 'error');
-                    uploadBtn.disabled = false;
+                    if (uploadBtn) uploadBtn.disabled = false;
+                    if (headerUploadBtn) headerUploadBtn.disabled = false;
                     progressContainer.style.display = 'none';
                 }
             };
 
             xhr.onerror = () => {
                 showDynamicAlert('Network error during upload.', 'error');
-                uploadBtn.disabled = false;
+                if (uploadBtn) uploadBtn.disabled = false;
+                if (headerUploadBtn) headerUploadBtn.disabled = false;
                 progressContainer.style.display = 'none';
             };
 
@@ -930,17 +1005,26 @@
     const renameTargetFilename = document.getElementById('rename-target-filename');
     const renameOriginalLabel = document.getElementById('rename-original-label');
     const renameInput = document.getElementById('new-filename-input');
+    const renameErrorMsg = document.getElementById('rename-error-msg');
 
     function openRenameModal(filename, originalName) {
         renameTargetFilename.value = filename;
         renameOriginalLabel.textContent = originalName;
         renameInput.value = originalName;
+        if (renameErrorMsg) {
+            renameErrorMsg.style.display = 'none';
+            renameErrorMsg.textContent = '';
+        }
         renameModal.classList.add('active');
         renameInput.focus();
     }
 
     function closeRenameModal() {
         renameModal.classList.remove('active');
+        if (renameErrorMsg) {
+            renameErrorMsg.style.display = 'none';
+            renameErrorMsg.textContent = '';
+        }
         renameForm.reset();
     }
 
@@ -951,6 +1035,10 @@
             const newName = renameInput.value.trim();
 
             if (!newName) return;
+            if (renameErrorMsg) {
+                renameErrorMsg.style.display = 'none';
+                renameErrorMsg.textContent = '';
+            }
 
             // Submit AJAX
             fetch(`/rename/${filename}`, {
@@ -967,44 +1055,44 @@
                 return res.json();
             })
             .then(data => {
-                showDynamicAlert(data.message || 'File renamed successfully.', 'success');
                 closeRenameModal();
-                setTimeout(() => location.reload(), 1000);
+                setTimeout(() => location.reload(), 100);
             })
             .catch(err => {
-                showDynamicAlert(err.message, 'error');
+                if (renameErrorMsg) {
+                    renameErrorMsg.textContent = err.message;
+                    renameErrorMsg.style.display = 'block';
+                } else {
+                    showDynamicAlert(err.message, 'error');
+                }
             });
         });
     }
 
-    // --- AJAX: Delete File ---
-    const deleteModal = document.getElementById('delete-modal');
-    const deleteOriginalLabel = document.getElementById('delete-original-label');
+    // --- AJAX: Inline Delete File ---
+    function showInlineDeletePrompt(filename) {
+        // Reset any other open delete prompts
+        document.querySelectorAll('.delete-confirm-inline').forEach(el => el.style.display = 'none');
+        document.querySelectorAll('.file-actions').forEach(el => el.style.display = 'flex');
 
-    function openDeleteModal(filename, originalName) {
-        activeDeleteFilename = filename;
-        deleteOriginalLabel.textContent = originalName;
-        deleteModal.classList.add('active');
+        // Hide action buttons for this row
+        document.getElementById(`file-actions-${filename}`).style.display = 'none';
+        // Show inline confirmation for this row
+        document.getElementById(`delete-confirm-${filename}`).style.display = 'flex';
     }
 
-    // Explicit function bindings for HTML buttons click context
-    window.openRenameModal = openRenameModal;
-    window.closeRenameModal = closeRenameModal;
-    window.openDeleteModal = openDeleteModal;
-    window.closeDeleteModal = closeDeleteModal;
-
-    function closeDeleteModal() {
-        deleteModal.classList.remove('active');
-        activeDeleteFilename = null;
+    function cancelInlineDelete(filename) {
+        document.getElementById(`delete-confirm-${filename}`).style.display = 'none';
+        document.getElementById(`file-actions-${filename}`).style.display = 'flex';
     }
 
-    function executeDelete() {
-        if (!activeDeleteFilename) return;
+    function executeInlineDelete(filename) {
+        const confirmBtn = document.getElementById(`confirm-delete-${filename}`);
+        const cancelBtn = document.getElementById(`cancel-delete-${filename}`);
+        if (confirmBtn) confirmBtn.disabled = true;
+        if (cancelBtn) cancelBtn.disabled = true;
 
-        const confirmBtn = document.getElementById('delete-confirm-btn');
-        confirmBtn.disabled = true;
-
-        fetch(`/delete/${activeDeleteFilename}`, {
+        fetch(`/delete/${filename}`, {
             method: 'POST'
         })
         .then(res => {
@@ -1014,21 +1102,26 @@
             return res.json();
         })
         .then(data => {
-            showDynamicAlert(data.message || 'File deleted successfully.', 'success');
-            closeDeleteModal();
-            setTimeout(() => location.reload(), 1000);
+            setTimeout(() => location.reload(), 100);
         })
         .catch(err => {
             showDynamicAlert(err.message, 'error');
-            confirmBtn.disabled = false;
+            if (confirmBtn) confirmBtn.disabled = false;
+            if (cancelBtn) cancelBtn.disabled = false;
+            cancelInlineDelete(filename);
         });
     }
-    window.executeDelete = executeDelete;
+
+    // Explicit function bindings for HTML buttons click context
+    window.openRenameModal = openRenameModal;
+    window.closeRenameModal = closeRenameModal;
+    window.showInlineDeletePrompt = showInlineDeletePrompt;
+    window.cancelInlineDelete = cancelInlineDelete;
+    window.executeInlineDelete = executeInlineDelete;
 
     // Global Modal Close Handlers (clicking outside card)
     window.addEventListener('click', (e) => {
         if (e.target === renameModal) closeRenameModal();
-        if (e.target === deleteModal) closeDeleteModal();
     });
 </script>
 {% endblock %}

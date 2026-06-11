@@ -304,34 +304,51 @@ main {
 
 /* Messages / Alerts */
 .alerts-container {
-    width: 100%;
-    max-width: 440px;
-    margin-bottom: 1rem;
+    position: fixed;
+    top: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 10000;
+    width: 90%;
+    max-width: 480px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    pointer-events: none;
 }
 
 .alert {
+    pointer-events: auto;
     padding: 1rem 1.25rem;
     border-radius: var(--radius-md);
     font-size: 0.9rem;
     font-weight: 500;
-    margin-bottom: 0.75rem;
     display: flex;
     align-items: center;
     gap: 0.75rem;
     animation: slideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-    backdrop-filter: blur(10px);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+    transition: opacity 0.5s ease, transform 0.5s ease;
 }
 
 .alert-success {
-    background: var(--success-glow);
-    border: 1px solid rgba(16, 185, 129, 0.2);
+    background: rgba(16, 185, 129, 0.15);
+    border: 1px solid rgba(16, 185, 129, 0.3);
     color: var(--success);
 }
 
 .alert-error, .alert-danger {
-    background: var(--danger-glow);
-    border: 1px solid rgba(239, 68, 68, 0.2);
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.3);
     color: var(--danger);
+}
+
+.alert-warning {
+    background: rgba(245, 158, 11, 0.15);
+    border: 1px solid rgba(245, 158, 11, 0.3);
+    color: var(--warning);
 }
 
 /* Auth Links */

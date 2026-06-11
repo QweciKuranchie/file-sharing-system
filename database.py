@@ -256,3 +256,36 @@ def get_all_files() -> list[dict[str, Any]]:
         return [dict(row) for row in rows]
     finally:
         conn.close()
+
+
+def get_filtered_files(search: str = None, file_type: str = None) -> list[dict[str, Any]]:
+    """Return filtered files joined with their owner's username, newest first."""
+    conn = get_connection()
+    try:
+        query = """
+            SELECT f.id, f.filename, f.original_name, f.file_type,
+                   f.file_size_bytes, f.uploaded_at, f.owner_id,
+                   u.username AS owner_username
+            FROM files f
+            JOIN users u ON f.owner_id = u.id
+        """
+        where_clauses = []
+        params = []
+
+        if search:
+            where_clauses.append("(f.original_name LIKE ? OR f.filename LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+
+        if file_type and file_type.lower() != 'all':
+            where_clauses.append("LOWER(f.file_type) = ?")
+            params.append(file_type.lower())
+
+        if where_clauses:
+            query += " WHERE " + " AND ".join(where_clauses)
+
+        query += " ORDER BY f.uploaded_at DESC, f.id DESC"
+        
+        rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()

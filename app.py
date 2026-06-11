@@ -21,10 +21,13 @@ app = Flask(__name__)
 secret_key = os.environ.get("SECRET_KEY")
 if not secret_key:
     is_testing = ("pytest" in sys.modules or "unittest" in sys.modules or "pytest_current_test" in os.environ)
+    is_production = os.environ.get("ENV") == "production" or os.environ.get("FLASK_ENV") == "production"
     if is_testing:
         secret_key = "test-secret-key-12345"
+    elif not is_production:
+        secret_key = "dev-secret-key-67890"
     else:
-        raise RuntimeError("SECRET_KEY environment variable is required but not set.")
+        raise RuntimeError("SECRET_KEY environment variable is required but not set in production.")
 app.secret_key = secret_key
 
 # Set explicit session cookie security options

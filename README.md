@@ -80,12 +80,16 @@ Set environment variables to override defaults, or edit [`config.py`](config.py)
 | `REPLICA_HOST` | `127.0.0.1` | Replica server IP address |
 | `REPLICA_PORT` | `9001` | Replica server TCP port |
 | `FLASK_PORT` | `5000` | Flask HTTP port |
-| `TCP_SHARED_SECRET` | `default-tcp-shared-secret-key-12345` | Shared secret for internal TCP authentication |
+| `TCP_CLIENT_SECRET` | `default-test-client-secret-12345` | Secret for client and Flask app TCP connections |
+| `TCP_REPLICATION_SECRET` | `default-test-replication-secret-67890` | Secret for replication module TCP connections |
+| `SECRET_KEY` | `dev-secret-key-67890` (Dev) | Secret key for Flask session cookie signatures |
 
 ### 3. Start the Servers
 
 Start each component in a separate terminal. **Order matters** — start the replica first.
 
+#### Development Mode:
+By default, the application runs in development mode and uses hardcoded test secrets.
 ```bash
 # Terminal 1 — Replica Server
 python replica_server.py
@@ -94,6 +98,28 @@ python replica_server.py
 python primary_server.py
 
 # Terminal 3 — Flask Web App
+python app.py
+```
+
+#### Production Mode:
+In production, you must set `ENV=production` or `FLASK_ENV=production` along with custom secrets:
+```bash
+# Terminal 1 — Replica Server
+export ENV=production
+export TCP_CLIENT_SECRET="your-secure-client-secret"
+export TCP_REPLICATION_SECRET="your-secure-replication-secret"
+python replica_server.py
+
+# Terminal 2 — Primary Server
+export ENV=production
+export TCP_CLIENT_SECRET="your-secure-client-secret"
+export TCP_REPLICATION_SECRET="your-secure-replication-secret"
+python primary_server.py
+
+# Terminal 3 — Flask Web App
+export ENV=production
+export SECRET_KEY="your-secure-session-key"
+export TCP_CLIENT_SECRET="your-secure-client-secret"
 python app.py
 ```
 

@@ -13,10 +13,10 @@ pytest==9.0.3
 pytest-timeout==2.4.0
 
 # Core web framework
-Flask>=3.0,<4.0
+Flask==3.0.3
 
 # JWT authentication
-PyJWT>=2.8,<3.0
+PyJWT==2.8.0
 
 # Password hashing (bundled with Flask via Werkzeug, listed explicitly for clarity)
-Werkzeug>=3.0,<4.0
+Werkzeug==3.0.3

@@ -275,9 +275,19 @@ class TestAppRoutes(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"test file.txt", response.data)
         self.assertIn(b"uploader_file.txt", response.data)
-        self.assertIn(b"download-btn-uploader_file.txt", response.data)
-        self.assertIn(b"rename-btn-uploader_file.txt", response.data)
-        self.assertIn(b"delete-btn-uploader_file.txt", response.data)
+        
+        # Validate refactored action controls and current button IDs
+        self.assertIn(b'id="download-btn-1"', response.data)
+        self.assertIn(b'id="rename-btn-1"', response.data)
+        self.assertIn(b'id="delete-btn-1"', response.data)
+        
+        # Validate data-attribute-driven action controls and classes
+        self.assertIn(b'class="action-button btn-download"', response.data)
+        self.assertIn(b'class="action-button btn-rename-trigger"', response.data)
+        self.assertIn(b'class="action-button btn-delete-trigger"', response.data)
+        self.assertIn(b'data-filename="uploader_file.txt"', response.data)
+        self.assertIn(b'data-originalname="test file.txt"', response.data)
+        self.assertIn(b'data-index="1"', response.data)
 
     @patch('app.socket.socket')
     def test_upload_replication_warning(self, mock_socket_class):
@@ -521,6 +531,95 @@ class TestAppRoutes(unittest.TestCase):
         self.assertTrue(app_module.PRIMARY_DOWN)
 
     @patch('app.socket.socket')
+    def test_download_triggers_failover_cookie_and_dashboard(self, mock_socket_class):
+        self.client.post('/register', data={
+            'username': 'dl_failover_db',
+            'email': 'dl_failover_db@example.com',
+            'password': 'password123',
+            'confirm_password': 'password123'
+        })
+        self.client.post('/login', data={
+            'username': 'dl_failover_db',
+            'password': 'password123'
+        })
+        
+        user_id = auth.login_user('dl_failover_db', 'password123')
+        u_payload = auth.decode_token(user_id)
+        u_id = u_payload['user_id']
+        auth.add_file('failover_db.txt', 'orig_failover_db.txt', 'document', 12, u_id)
+        
+        # Reset the global failover state first
+        import app as app_module
+        app_module.PRIMARY_DOWN = False
+        with self.client.session_transaction() as sess:
+            sess.pop('primary_down', None)
+        
+        # 1. PING succeeds (1st socket)
+        sock_ping = SocketMock(b"OK PONG\n")
+        # 2. Primary download connection fails (2nd socket)
+        sock_primary = SocketMock(b"", raise_on_connect=ConnectionRefusedError("Offline"))
+        # 3. Replica download succeeds (3rd socket)
+        sock_replica = SocketMock(b"OK 12\nreplica data")
+        
+        mock_socket_class.side_effect = [sock_ping, sock_primary, sock_replica]
+        
+        # Request the download which triggers failover
+        response = self.client.get('/download/failover_db.txt')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b"replica data")
+        
+        # Verify the global server state is updated
+        self.assertTrue(app_module.PRIMARY_DOWN)
+        
+        # Verify that the download response sets the primary_down cookie to true
+        cookies = response.headers.getlist('Set-Cookie')
+        self.assertTrue(any('primary_down=true' in c for c in cookies))
+        
+        # Subsequent requests to dashboard should return primary_down=true cookie
+        dash_response = self.client.get('/dashboard')
+        self.assertEqual(dash_response.status_code, 200)
+        dash_cookies = dash_response.headers.getlist('Set-Cookie')
+        self.assertTrue(any('primary_down=true' in c for c in dash_cookies))
+        
+        # Verify that the dashboard HTML contains the failover banner element
+        self.assertIn('id="failover-mode-banner"', dash_response.get_data(as_text=True))
+        
+        # Verify that write operations (upload, rename, delete) are rejected with 503
+        import tempfile
+        upload_resp = self.client.post('/upload', data={
+            'file': (tempfile.SpooledTemporaryFile(), 'test_fail.txt')
+        })
+        self.assertEqual(upload_resp.status_code, 503)
+        self.assertIn("unavailable in failover mode", upload_resp.get_json()['message'])
+        
+        rename_resp = self.client.post('/rename/failover_db.txt', data={'new_name': 'new_fail.txt'})
+        self.assertEqual(rename_resp.status_code, 503)
+        self.assertIn("unavailable in failover mode", rename_resp.get_json()['message'])
+        
+        delete_resp = self.client.post('/delete/failover_db.txt')
+        self.assertEqual(delete_resp.status_code, 503)
+        self.assertIn("unavailable in failover mode", delete_resp.get_json()['message'])
+
+        # Verify that the dashboard HTML contains the correct refactored controls and JS selectors
+        dash_html = dash_response.get_data(as_text=True)
+        # Refactored action elements must be present in dashboard HTML
+        self.assertIn('class="action-button btn-rename-trigger"', dash_html)
+        self.assertIn('class="action-button btn-delete-trigger"', dash_html)
+        self.assertIn('id="rename-submit-btn"', dash_html)
+        self.assertIn('id="delete-confirm-btn"', dash_html)
+        self.assertIn('class="action-button btn-confirm-delete btn-delete"', dash_html)
+        
+        # updateFailoverUI JS must target them correctly to disable write entry/confirmations
+        self.assertIn('.btn-rename-trigger', dash_html)
+        self.assertIn('.btn-delete-trigger', dash_html)
+        self.assertIn('#rename-submit-btn', dash_html)
+        self.assertIn('#delete-confirm-btn', dash_html)
+        self.assertIn('.btn-confirm-delete', dash_html)
+        
+        # Reset the global failover state
+        app_module.PRIMARY_DOWN = False
+
+    @patch('app.socket.socket')
     def test_delete_success(self, mock_socket_class):
         self.client.post('/register', data={
             'username': 'deleter',
@@ -679,9 +778,19 @@ class TestAppRoutes(unittest.TestCase):
         self.assertIn(b"My Cloud File.pdf", response.data)
         self.assertIn(b"1.0 KB", response.data)
         self.assertIn(b"dash_stored.pdf", response.data)
-        self.assertIn(b"download-btn-dash_stored.pdf", response.data)
-        self.assertIn(b"rename-btn-dash_stored.pdf", response.data)
-        self.assertIn(b"delete-btn-dash_stored.pdf", response.data)
+        
+        # Validate refactored action controls and current button IDs
+        self.assertIn(b'id="download-btn-1"', response.data)
+        self.assertIn(b'id="rename-btn-1"', response.data)
+        self.assertIn(b'id="delete-btn-1"', response.data)
+        
+        # Validate data-attribute-driven action controls and classes
+        self.assertIn(b'class="action-button btn-download"', response.data)
+        self.assertIn(b'class="action-button btn-rename-trigger"', response.data)
+        self.assertIn(b'class="action-button btn-delete-trigger"', response.data)
+        self.assertIn(b'data-filename="dash_stored.pdf"', response.data)
+        self.assertIn(b'data-originalname="My Cloud File.pdf"', response.data)
+        self.assertIn(b'data-index="1"', response.data)
 
     @patch('app.socket.socket')
     @patch('auth.add_file')
@@ -1598,6 +1707,311 @@ class TestQuotaReservation(unittest.TestCase):
         from config import TCP_CLIENT_SECRET
         expected_auth_cmd = f"AUTH {TCP_CLIENT_SECRET}\n"
         self.assertTrue(sock_primary_fail.sent_data.startswith(expected_auth_cmd.encode('utf-8')))
+
+    @patch('app.socket.socket')
+    def test_download_triggers_failover_updates_session_and_headers(self, mock_socket_class):
+        u_id = self._register_login('failover_trigger_user', 'ftu@example.com')
+        auth.add_file('failover_trigger.txt', 'failover_trigger.txt', 'document', 10, u_id)
+        
+        # Reset global primary down first
+        import app as app_module
+        app_module.PRIMARY_DOWN = False
+        with self.client.session_transaction() as sess:
+            sess.pop('primary_down', None)
+            
+        # 1. PING succeeds (ping timeout 5.0)
+        sock_ping = SocketMock(b"OK PONG\n")
+        # 2. Primary download connection fails (ConnectionRefusedError) -> triggers failover
+        sock_primary = SocketMock(b"", raise_on_connect=ConnectionRefusedError("Offline"))
+        # 3. Replica download succeeds
+        sock_replica = SocketMock(b"OK 10\n1234567890")
+        
+        mock_socket_class.side_effect = [sock_ping, sock_primary, sock_replica]
+        
+        response = self.client.get('/download/failover_trigger.txt')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get('X-Primary-Down'), 'true')
+        
+        # Verify the session has been updated immediately
+        with self.client.session_transaction() as sess:
+            self.assertTrue(sess.get('primary_down'))
+
+    @patch('app.socket.socket')
+    def test_health_check_timeout_and_recovery(self, mock_socket_class):
+        u_id = self._register_login('health_check_user', 'hcu@example.com')
+        
+        # Reset global primary down first
+        import app as app_module
+        app_module.PRIMARY_DOWN = True
+        with self.client.session_transaction() as sess:
+            sess['primary_down'] = True
+            
+        # 1st request: ping succeeds -> recovery detected immediately on next request
+        sock_ping_1 = SocketMock(b"OK PONG\n")
+        sock_list_files = SocketMock(b"OK []\n")
+        mock_socket_class.side_effect = [sock_ping_1, sock_list_files]
+        
+        response = self.client.get('/dashboard')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get('X-Primary-Down'), 'false')
+        
+        # Verify global and session states are updated immediately to False
+        self.assertFalse(app_module.PRIMARY_DOWN)
+        with self.client.session_transaction() as sess:
+            self.assertFalse(sess.get('primary_down', False))
+
+    @patch('app.ping_server')
+    def test_health_check_uses_5s_timeout(self, mock_ping_server):
+        mock_ping_server.return_value = True
+        
+        # Access a non-static/non-auth endpoint (which runs check_primary_health)
+        response = self.client.get('/dashboard')
+        self.assertEqual(response.status_code, 200)
+        
+        # Verify ping_server was called with timeout=5.0
+        mock_ping_server.assert_called_with('127.0.0.1', 9000, timeout=5.0)
+
+    @patch('app.ping_server')
+    def test_health_check_recovery_detected_on_next_request_targeted(self, mock_ping_server):
+        # Enforce that primary starts in DOWN state
+        import app as app_module
+        app_module.PRIMARY_DOWN = True
+        with self.client.session_transaction() as sess:
+            sess['primary_down'] = True
+
+        self._register_login('recovery_user_target', 'recovery_target@example.com')
+
+        # Simulate that primary server recovers
+        mock_ping_server.return_value = True
+
+        # Next request to a checked endpoint (e.g. /dashboard)
+        response = self.client.get('/dashboard')
+        self.assertEqual(response.status_code, 200)
+
+        # Recovery should be detected immediately on the next request
+        self.assertFalse(app_module.PRIMARY_DOWN)
+        self.assertEqual(response.headers.get('X-Primary-Down'), 'false')
+        with self.client.session_transaction() as sess:
+            self.assertFalse(sess.get('primary_down', False))
+
+    @patch('app.ping_server')
+    def test_health_check_recovery_clears_failover_on_auth_pages(self, mock_ping_server):
+        # Enforce that primary starts in DOWN state
+        import app as app_module
+        app_module.PRIMARY_DOWN = True
+        with self.client.session_transaction() as sess:
+            sess['primary_down'] = True
+
+        # Simulate that primary server recovers
+        mock_ping_server.return_value = True
+
+        # Next request is to an auth page, e.g., /login
+        response = self.client.get('/login')
+        self.assertEqual(response.status_code, 200)
+
+        # Recovery should be detected immediately on the next request
+        self.assertFalse(app_module.PRIMARY_DOWN)
+        self.assertEqual(response.headers.get('X-Primary-Down'), 'false')
+        with self.client.session_transaction() as sess:
+            self.assertFalse(sess.get('primary_down', False))
+        
+        # Now let's do the same for /register
+        app_module.PRIMARY_DOWN = True
+        with self.client.session_transaction() as sess:
+            sess['primary_down'] = True
+            
+        response = self.client.get('/register')
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(app_module.PRIMARY_DOWN)
+        self.assertEqual(response.headers.get('X-Primary-Down'), 'false')
+        with self.client.session_transaction() as sess:
+            self.assertFalse(sess.get('primary_down', False))
+
+        # Now let's do the same for /logout
+        app_module.PRIMARY_DOWN = True
+        with self.client.session_transaction() as sess:
+            sess['primary_down'] = True
+            
+        response = self.client.get('/logout')
+        # /logout redirects to /login, returning status_code 302
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(app_module.PRIMARY_DOWN)
+        self.assertEqual(response.headers.get('X-Primary-Down'), 'false')
+        with self.client.session_transaction() as sess:
+            self.assertFalse(sess.get('primary_down', False))
+
+        # Now let's do the same for index (/)
+        app_module.PRIMARY_DOWN = True
+        with self.client.session_transaction() as sess:
+            sess['primary_down'] = True
+            
+        response = self.client.get('/')
+        # / redirects to /login or /dashboard, returning status_code 302
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(app_module.PRIMARY_DOWN)
+        self.assertEqual(response.headers.get('X-Primary-Down'), 'false')
+        with self.client.session_transaction() as sess:
+            self.assertFalse(sess.get('primary_down', False))
+
+    @patch('app.socket.socket')
+    def test_health_check_slow_but_responsive_primary_no_failover(self, mock_socket_class):
+        self._register_login('slow_user_target', 'slow_target@example.com')
+
+        import app as app_module
+        app_module.PRIMARY_DOWN = False
+        with self.client.session_transaction() as sess:
+            sess.pop('primary_down', None)
+
+        # Mock a socket that records settimeout calls and returns OK PONG
+        class ResponsiveSocket(SocketMock):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.timeout_val = None
+            def settimeout(self, t):
+                self.timeout_val = t
+
+        sock_ping = ResponsiveSocket(b"OK PONG\n")
+        mock_socket_class.return_value = sock_ping
+
+        # Make the request to a checked endpoint
+        response = self.client.get('/dashboard')
+        self.assertEqual(response.status_code, 200)
+
+        # Verify that socket timeout was set to 5.0 (the specified 5-second window)
+        self.assertEqual(sock_ping.timeout_val, 5.0)
+
+        # The primary should not be marked down, and headers should show primary is up
+        self.assertFalse(app_module.PRIMARY_DOWN)
+        self.assertEqual(response.headers.get('X-Primary-Down'), 'false')
+
+    @patch('app.socket.socket')
+    def test_health_check_primary_timeout_forces_failover(self, mock_socket_class):
+        self._register_login('timeout_user_target', 'timeout_target@example.com')
+
+        import app as app_module
+        app_module.PRIMARY_DOWN = False
+        with self.client.session_transaction() as sess:
+            sess.pop('primary_down', None)
+
+        # Simulate socket timing out (raising socket.timeout)
+        mock_socket_class.side_effect = socket.timeout("Connection timed out")
+
+        # Make the request to a checked endpoint
+        response = self.client.get('/dashboard')
+        self.assertEqual(response.status_code, 200)
+
+        # Failover should be forced immediately
+        self.assertTrue(app_module.PRIMARY_DOWN)
+        self.assertEqual(response.headers.get('X-Primary-Down'), 'true')
+
+    @patch('app.socket.socket')
+    def test_download_failover_regression_reflected_immediately(self, mock_socket_class):
+        u_id = self._register_login('failover_regress', 'freg@example.com')
+        auth.add_file('regress.txt', 'regress.txt', 'document', 10, u_id)
+        
+        # Reset global primary down first
+        import app as app_module
+        app_module.PRIMARY_DOWN = False
+        with self.client.session_transaction() as sess:
+            sess.pop('primary_down', None)
+            
+        # 1. PING succeeds
+        sock_ping = SocketMock(b"OK PONG\n")
+        # 2. Primary download fails -> triggers failover to replica
+        sock_primary = SocketMock(b"", raise_on_connect=ConnectionRefusedError("Offline"))
+        # 3. Replica download succeeds
+        sock_replica = SocketMock(b"OK 10\n1234567890")
+        
+        mock_socket_class.side_effect = [sock_ping, sock_primary, sock_replica]
+        
+        # Make the download request
+        response = self.client.get('/download/regress.txt')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b"1234567890")
+        
+        # Assert immediate failover signals (header + cookie)
+        self.assertEqual(response.headers.get('X-Primary-Down'), 'true')
+        self.assertEqual(response.headers.get('X-Failover-Triggered'), 'true')
+        cookies = response.headers.getlist('Set-Cookie')
+        self.assertTrue(any('primary_down=true' in c for c in cookies))
+        
+        # Verify global state updated immediately
+        self.assertTrue(app_module.PRIMARY_DOWN)
+        
+        # Verify subsequent session contains primary_down
+        with self.client.session_transaction() as sess:
+            self.assertTrue(sess.get('primary_down'))
+            
+        # Make subsequent dashboard request
+        dash_response = self.client.get('/dashboard')
+        self.assertEqual(dash_response.status_code, 200)
+        
+        # Verify that the dashboard HTML contains the failover mode banner
+        self.assertIn('id="failover-mode-banner"', dash_response.get_data(as_text=True))
+
+    @patch('app.socket.socket')
+    def test_health_check_recovery_via_socket_mock(self, mock_socket_class):
+        self._register_login('socket_recovery', 'sock_rec@example.com')
+        import app as app_module
+        app_module.PRIMARY_DOWN = True
+        with self.client.session_transaction() as sess:
+            sess['primary_down'] = True
+
+        # First request: PING fails (ConnectionRefusedError) -> still down
+        sock_ping_fail = SocketMock(b"", raise_on_connect=ConnectionRefusedError("Offline"))
+        
+        # Second request: PING succeeds -> recovers
+        sock_ping_success = SocketMock(b"OK PONG\n")
+        
+        mock_socket_class.side_effect = [sock_ping_fail, sock_ping_success]
+        
+        # 1. First request
+        response1 = self.client.get('/dashboard')
+        self.assertEqual(response1.status_code, 200)
+        self.assertTrue(app_module.PRIMARY_DOWN)
+        self.assertEqual(response1.headers.get('X-Primary-Down'), 'true')
+        
+        # 2. Second request
+        response2 = self.client.get('/dashboard')
+        self.assertEqual(response2.status_code, 200)
+        # Verify recovery detected immediately on this request
+        self.assertFalse(app_module.PRIMARY_DOWN)
+        self.assertEqual(response2.headers.get('X-Primary-Down'), 'false')
+        with self.client.session_transaction() as sess:
+            self.assertFalse(sess.get('primary_down', False))
+
+    @patch('app.socket.socket')
+    def test_health_check_slow_but_healthy_primary(self, mock_socket_class):
+        self._register_login('slow_healthy', 'slow_h@example.com')
+        import app as app_module
+        app_module.PRIMARY_DOWN = False
+        with self.client.session_transaction() as sess:
+            sess.pop('primary_down', None)
+
+        # Mock a socket that succeeds
+        sock_ping = SocketMock(b"OK PONG\n")
+        mock_socket_class.return_value = sock_ping
+        
+        # We access /dashboard. It should set timeout to 5.0 and remain healthy.
+        response = self.client.get('/dashboard')
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(app_module.PRIMARY_DOWN)
+        self.assertEqual(response.headers.get('X-Primary-Down'), 'false')
+
+    @patch('app.socket.socket')
+    def test_upload_invalid_filename_characters(self, mock_socket_class):
+        self._register_login('bad_filename_user', 'bad_fn@example.com')
+        
+        # We try to upload a file with quotes and script tags in original_name
+        data = {
+            'file': (tempfile.SpooledTemporaryFile(), 'test"onclick="alert(1)".txt')
+        }
+        data['file'][0].write(b"content")
+        data['file'][0].seek(0)
+        
+        response = self.client.post('/upload', data=data, content_type='multipart/form-data')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Invalid filename characters", response.get_json()['message'])
 
 
 if __name__ == '__main__':

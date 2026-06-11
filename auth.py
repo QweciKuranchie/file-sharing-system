@@ -36,6 +36,7 @@ from database import (
     delete_file,
     rename_file,
     get_all_files,
+    get_filtered_files,
     delete_file_and_decrement_quota,
 )
 

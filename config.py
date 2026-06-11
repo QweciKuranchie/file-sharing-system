@@ -47,18 +47,19 @@ FLASK_PORT = int(os.environ.get("FLASK_PORT", 5000))
 # ---------------------------------------------------------------------------
 import sys
 is_testing = ("pytest" in sys.modules or "unittest" in sys.modules or "pytest_current_test" in os.environ)
+is_production = os.environ.get("ENV") == "production" or os.environ.get("FLASK_ENV") == "production"
 
 TCP_CLIENT_SECRET = os.environ.get("TCP_CLIENT_SECRET")
 TCP_REPLICATION_SECRET = os.environ.get("TCP_REPLICATION_SECRET")
 
-if not is_testing:
+if is_production:
     if not TCP_CLIENT_SECRET or not TCP_REPLICATION_SECRET:
         raise RuntimeError(
             "Explicit configuration of TCP_CLIENT_SECRET and TCP_REPLICATION_SECRET "
-            "environment variables is required for non-test runs."
+            "environment variables is required in production."
         )
 else:
-    # Defaults for test suite runs
+    # Defaults for development and test suite runs
     if not TCP_CLIENT_SECRET:
         TCP_CLIENT_SECRET = "default-test-client-secret-12345"
     if not TCP_REPLICATION_SECRET:

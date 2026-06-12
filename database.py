@@ -226,15 +226,34 @@ def delete_file_and_decrement_quota(filename: str) -> None:
         conn.close()
 
 
-def rename_file(old_filename: str, new_filename: str) -> None:
-    """Rename a file record in the database."""
+def rename_file(old_filename: str, new_filename: str, new_original_name: str | None = None) -> None:
+    """Rename a file record in the database.
+    
+    Parameters
+    ----------
+    old_filename : str
+        The current stored filename (used to locate the row).
+    new_filename : str
+        The new stored filename (safe, on-disk name).
+    new_original_name : str, optional
+        The new display name to show users. If omitted, the existing
+        original_name is preserved (recommended — don't overwrite display name
+        with the sanitised stored name).
+    """
     conn = get_connection()
     try:
         with conn:
-            conn.execute(
-                "UPDATE files SET filename = ?, original_name = ? WHERE filename = ?",
-                (new_filename, new_filename, old_filename),
-            )
+            if new_original_name is not None:
+                conn.execute(
+                    "UPDATE files SET filename = ?, original_name = ? WHERE filename = ?",
+                    (new_filename, new_original_name, old_filename),
+                )
+            else:
+                # Preserve the existing original_name — only update the stored filename
+                conn.execute(
+                    "UPDATE files SET filename = ? WHERE filename = ?",
+                    (new_filename, old_filename),
+                )
     finally:
         conn.close()
 
@@ -258,7 +277,7 @@ def get_all_files() -> list[dict[str, Any]]:
         conn.close()
 
 
-def get_filtered_files(search: str = None, file_type: str = None) -> list[dict[str, Any]]:
+def get_filtered_files(search: str | None = None, file_type: str | None = None) -> list[dict[str, Any]]:
     """Return filtered files joined with their owner's username, newest first."""
     conn = get_connection()
     try:

@@ -56,6 +56,9 @@ def login_required(f):
 
 # TCP Socket Protocol Helpers
 def read_line(sock):
+    """Read one text line from a socket, byte by byte. Safe for control lines only.
+    Do NOT use for sockets that will subsequently stream binary data —
+    use read_line_buffered() instead so no binary bytes are consumed."""
     line = bytearray()
     while True:
         c = sock.recv(1)
@@ -65,6 +68,22 @@ def read_line(sock):
         if c == b'\n':
             break
     return line.decode('utf-8').strip()
+
+def read_line_buffered(sock, buf_size=4096):
+    """Read one text line from a socket using a read buffer.
+    Returns (line_str, leftover_bytes) where leftover_bytes is any data
+    already received from the socket that comes after the newline.
+    Use this before streaming binary data to avoid losing the first bytes."""
+    buffer = bytearray()
+    while b'\n' not in buffer:
+        chunk = sock.recv(buf_size)
+        if not chunk:
+            break
+        buffer.extend(chunk)
+    if b'\n' in buffer:
+        line_bytes, leftover = buffer.split(b'\n', 1)
+        return line_bytes.decode('utf-8').strip(), bytes(leftover)
+    return buffer.decode('utf-8', errors='replace').strip(), b''
 
 def connect_and_authenticate(host, port, timeout=5):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -454,11 +473,12 @@ def download_file(filename):
     
     failover_triggered = False
     s = None
+    leftover = b''
     try:
         s = connect_and_authenticate(host, port, timeout=5)
         s.sendall(f"DOWNLOAD {filename}\n".encode('utf-8'))
         
-        resp_line = read_line(s)
+        resp_line, leftover = read_line_buffered(s)
         if not resp_line:
             raise socket.error("Header read failure: empty response")
             
@@ -497,7 +517,7 @@ def download_file(filename):
                 s = connect_and_authenticate(host, port, timeout=5)
                 s.sendall(f"DOWNLOAD {filename}\n".encode('utf-8'))
                 
-                resp_line = read_line(s)
+                resp_line, leftover = read_line_buffered(s)
                 if not resp_line:
                     raise socket.error("Header read failure: empty response")
                     
@@ -549,9 +569,17 @@ def download_file(filename):
                 response.set_cookie('primary_down', 'true', path='/', samesite='Lax')
             return response, 500
         
-    def generate_bytes(sock, size):
+    def generate_bytes(sock, size, initial_bytes=b''):
+        """Stream exactly 'size' bytes: first flush any buffered bytes from the
+        header read, then read the rest directly from the socket."""
         try:
             bytes_left = size
+            # Flush bytes already buffered during header read
+            if initial_bytes:
+                to_send = initial_bytes[:bytes_left]
+                yield to_send
+                bytes_left -= len(to_send)
+            # Stream remaining bytes from socket
             chunk_size = 65536
             while bytes_left > 0:
                 to_read = min(chunk_size, bytes_left)
@@ -568,16 +596,27 @@ def download_file(filename):
     if not mime_type:
         mime_type = 'application/octet-stream'
         
+    # Build the display filename for Content-Disposition.
+    # If the user renamed to something without an extension, fall back to the
+    # stored filename's extension so the browser can open the file correctly.
+    display_name = file_record['original_name']
+    _, disp_ext = os.path.splitext(display_name)
+    _, stored_ext = os.path.splitext(file_record['filename'])
+    if stored_ext and not disp_ext:
+        display_name = display_name + stored_ext
+    # Escape any double-quotes in the filename to keep the header valid
+    safe_display_name = display_name.replace('"', '\\"')
+
     headers = {
         'Content-Type': mime_type,
-        'Content-Disposition': f'attachment; filename="{file_record["original_name"]}"',
+        'Content-Disposition': f'attachment; filename="{safe_display_name}"',
         'Content-Length': str(file_size)
     }
     if failover_triggered or g.primary_down:
         headers['X-Primary-Down'] = 'true'
         headers['X-Failover-Triggered'] = 'true'
         
-    response = Response(generate_bytes(s, file_size), headers=headers)
+    response = Response(generate_bytes(s, file_size, leftover), headers=headers)
     if failover_triggered or g.primary_down:
         response.set_cookie('primary_down', 'true', path='/', samesite='Lax')
     return response
@@ -676,16 +715,27 @@ def rename_file(filename):
         
     if not new_name:
         return jsonify({"status": "error", "message": "New filename is required"}), 400
-        
-    new_name = os.path.basename(new_name.replace(" ", "_"))
+
+    # Preserve the user's typed name as the display label before sanitising
+    user_display_name = new_name.strip()
     import re
-    if (not new_name or 
-        new_name in ('.', '..') or 
-        '..' in new_name or 
-        new_name.startswith('.') or 
-        new_name.startswith('-') or 
-        new_name.endswith('.') or 
-        new_name.endswith('-') or 
+    new_name = os.path.basename(new_name.replace(" ", "_"))
+    new_name = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', new_name)  # sanitize special chars
+    new_name = re.sub(r'_+', '_', new_name).strip('_-')       # collapse/strip underscores
+
+    # Preserve the original file extension if the user did not include one
+    _, original_ext = os.path.splitext(file_record['filename'])
+    _, new_ext = os.path.splitext(new_name)
+    if original_ext and not new_ext:
+        new_name = new_name + original_ext
+
+    if (not new_name or
+        new_name in ('.', '..') or
+        '..' in new_name or
+        new_name.startswith('.') or
+        new_name.startswith('-') or
+        new_name.endswith('.') or
+        new_name.endswith('-') or
         not re.match(r'^[a-zA-Z0-9_\-\.]+$', new_name)):
         return jsonify({"status": "error", "message": "Invalid filename"}), 400
     
@@ -701,7 +751,7 @@ def rename_file(filename):
             actual_new_name = parts[2] if len(parts) > 2 else new_name
             
             try:
-                auth.rename_file(filename, actual_new_name)
+                auth.rename_file(filename, actual_new_name, new_original_name=user_display_name)
             except Exception as db_err:
                 try:
                     send_tcp_command(PRIMARY_HOST, PRIMARY_PORT, f"RENAME {actual_new_name} {filename}")

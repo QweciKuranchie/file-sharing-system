@@ -1067,39 +1067,60 @@
     // --- Download helper ---
     async function downloadFile(filename, originalName) {
         try {
-            const encodedFilename = encodeURIComponent(filename);
-            const response = await fetch(`/download/${encodedFilename}`);
-            
-            const primaryDown = response.headers.get('X-Primary-Down') === 'true' || response.headers.get('X-Failover-Triggered') === 'true';
-            if (primaryDown && typeof updateFailoverUI === 'function') {
-                document.cookie = "primary_down=true; path=/; SameSite=Lax";
-                updateFailoverUI(true);
-            }
+            const response = await fetch(`/download/${encodeURIComponent(filename)}`, {
+                credentials: 'same-origin'
+            });
 
-            if (!response.ok) {
-                let errorMsg = 'Download failed.';
-                try {
-                    const data = await response.json();
-                    errorMsg = data.message || errorMsg;
-                } catch(e) {}
-                showDynamicAlert(errorMsg, 'error');
+            // Detect session expiry (Flask redirects → /login)
+            if (response.redirected || response.url.includes('/login')) {
+                showDynamicAlert('Your session has expired. Please log in again.', 'error');
+                setTimeout(() => window.location.href = '/login', 1500);
                 return;
             }
 
+            if (!response.ok) {
+                let errMsg = 'Download failed.';
+                try {
+                    const data = await response.json();
+                    errMsg = data.message || errMsg;
+                } catch(e) {}
+                showDynamicAlert(errMsg, 'error');
+                return;
+            }
+
+            // File content is fully in memory — create a blob URL and trigger download.
+            // revokeObjectURL is intentionally delayed: the blob is in RAM, not on the
+            // network, so the download reads instantly, but we give it 60s to be safe.
             const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
+            const blobUrl = URL.createObjectURL(blob);
             const a = document.createElement('a');
-            a.style.display = 'none';
-            a.href = url;
-            a.download = originalName;
+            a.href = blobUrl;
+
+            // Ensure the saved filename always has the correct extension.
+            // If the user renamed to "test" (no ext) but stored file is "test.pdf",
+            // we append ".pdf" so the OS knows how to open it.
+            let downloadName = (originalName || filename).trim();
+            if (filename && filename.includes('.')) {
+                const storedExt = filename.substring(filename.lastIndexOf('.'));
+                if (!downloadName.includes('.')) {
+                    downloadName += storedExt;
+                }
+            }
+            a.download = downloadName;
+
             document.body.appendChild(a);
             a.click();
-            window.URL.revokeObjectURL(url);
             document.body.removeChild(a);
-        } catch (err) {
-            showDynamicAlert(err.message || 'Download failed.', 'error');
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+
+        } catch(err) {
+            showDynamicAlert(err.message || 'Download failed. Please try again.', 'error');
         }
     }
+
+
+
+
 
     document.addEventListener('DOMContentLoaded', () => {
 

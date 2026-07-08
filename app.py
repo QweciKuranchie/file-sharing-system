@@ -180,15 +180,30 @@ def get_file_type(filename):
 
 import time
 
+_last_ping_time: float = 0.0
+_ping_cache_seconds: float = 10.0   # re-ping at most once every 10 s
+
 @app.before_request
 def check_primary_health():
-    global PRIMARY_DOWN
-    # Only run health checks for non-static endpoints
+    global PRIMARY_DOWN, _last_ping_time
+    # Skip health checks for static assets
     if not request.endpoint or request.endpoint == 'static':
         g.primary_down = PRIMARY_DOWN or session.get('primary_down', False)
         return
-    PRIMARY_DOWN = not ping_server(PRIMARY_HOST, PRIMARY_PORT, timeout=5.0)
-    session['primary_down'] = PRIMARY_DOWN
+
+    now = time.time()
+    if now - _last_ping_time >= _ping_cache_seconds:
+        # Time to re-ping the primary
+        is_down = not ping_server(PRIMARY_HOST, PRIMARY_PORT, timeout=3.0)
+        _last_ping_time = now
+        PRIMARY_DOWN = is_down
+        if not is_down:
+            # Primary recovered — clear the failover flag from session so the
+            # UI reverts to normal mode without requiring a manual reload.
+            session.pop('primary_down', None)
+        else:
+            session['primary_down'] = True
+    # Use the cached result for this request
     g.primary_down = PRIMARY_DOWN
 
 @app.after_request
@@ -225,6 +240,40 @@ def load_user():
         except auth.TokenError:
             # If the JWT has expired or is invalid, clear it silently from session
             session.pop('token', None)
+
+
+@app.route('/health')
+def health_check():
+    """Diagnostic endpoint — shows exactly why the primary is considered up or down."""
+    from config import TCP_CLIENT_SECRET
+    secret_preview = (TCP_CLIENT_SECRET[:4] + '***') if TCP_CLIENT_SECRET else '(not set)'
+
+    ping_ok = False
+    ping_error = None
+    try:
+        s = connect_and_authenticate(PRIMARY_HOST, PRIMARY_PORT, timeout=3)
+        s.sendall(b"PING\n")
+        resp = read_line(s)
+        s.close()
+        ping_ok = (resp == "OK PONG")
+        ping_error = None if ping_ok else f"Unexpected response: {resp!r}"
+    except PermissionError as e:
+        ping_error = f"AUTH FAILED — secret mismatch. App sending prefix '{secret_preview}'. Primary rejected it. Restart all 3 processes in the same terminal with matching TCP_CLIENT_SECRET."
+    except ConnectionRefusedError:
+        ping_error = f"Connection refused — primary not listening on {PRIMARY_HOST}:{PRIMARY_PORT}"
+    except Exception as e:
+        ping_error = f"{type(e).__name__}: {e}"
+
+    return jsonify({
+        "primary_host": PRIMARY_HOST,
+        "primary_port": PRIMARY_PORT,
+        "secret_prefix_used": secret_preview,
+        "ping_ok": ping_ok,
+        "ping_error": ping_error,
+        "PRIMARY_DOWN_flag": PRIMARY_DOWN,
+        "session_primary_down": session.get('primary_down', False),
+        "cached_ping_age_seconds": round(time.time() - _last_ping_time, 1)
+    })
 
 
 @app.route('/')
@@ -306,8 +355,36 @@ def logout():
 def dashboard():
     search = request.args.get('search', '').strip()
     file_type = request.args.get('type', '').strip()
-    files = auth.get_filtered_files(search=search, file_type=file_type)
-    return render_template('dashboard.html', active_page='dashboard', files=files)
+    
+    folder_id_str = request.args.get('folder_id')
+    folder_id = None
+    current_folder = None
+    breadcrumbs = []
+    
+    if folder_id_str:
+        try:
+            folder_id = int(folder_id_str)
+            current_folder = auth.get_folder_by_id(folder_id)
+            if not current_folder:
+                flash("Folder not found.", "error")
+                return redirect(url_for('dashboard'))
+            breadcrumbs = auth.get_folder_path(folder_id)
+        except ValueError:
+            flash("Invalid folder ID.", "error")
+            return redirect(url_for('dashboard'))
+            
+    files = auth.get_visible_files_for_user(g.user['id'], folder_id=folder_id, search=search, file_type=file_type)
+    subfolders = auth.get_subfolders(parent_folder_id=folder_id)
+    
+    return render_template(
+        'dashboard.html',
+        active_page='dashboard',
+        files=files,
+        folders=subfolders,
+        current_folder_id=folder_id,
+        current_folder=current_folder,
+        breadcrumbs=breadcrumbs
+    )
 
 @app.route('/upload', methods=['POST'])
 @login_required
@@ -317,6 +394,19 @@ def upload_file():
             "status": "error", 
             "message": "Primary server is offline. Write operations are unavailable in failover mode."
         }), 503
+
+    folder_id_str = request.form.get('folder_id')
+    folder_id = None
+    if folder_id_str and folder_id_str != 'None' and folder_id_str != '':
+        try:
+            folder_id = int(folder_id_str)
+            folder = auth.get_folder_by_id(folder_id)
+            if not folder:
+                return jsonify({"status": "error", "message": "Target folder not found"}), 404
+            if folder['owner_id'] != g.user['id']:
+                return jsonify({"status": "error", "message": "Permission denied: folder owned by another user"}), 403
+        except ValueError:
+            return jsonify({"status": "error", "message": "Invalid folder ID"}), 400
 
     if 'file' not in request.files:
         return jsonify({"status": "error", "message": "No file selected"}), 400
@@ -379,7 +469,7 @@ def upload_file():
             saved_on_server = True
             
             file_type = get_file_type(saved_name)
-            auth.add_file(saved_name, original_name, file_type, file_size, g.user['id'])
+            auth.add_file(saved_name, original_name, file_type, file_size, g.user['id'], folder_id=folder_id)
             
             if saved_name != original_name:
                 msg = f"File uploaded and replicated successfully — saved as {saved_name}"
@@ -399,7 +489,7 @@ def upload_file():
             saved_on_server = True
             
             file_type = get_file_type(saved_name)
-            auth.add_file(saved_name, original_name, file_type, file_size, g.user['id'])
+            auth.add_file(saved_name, original_name, file_type, file_size, g.user['id'], folder_id=folder_id)
             
             msg = "File uploaded but replication failed. Replica may be out of sync."
             flash(msg, "warning")
@@ -468,6 +558,24 @@ def download_file(filename):
     if not file_record:
         return jsonify({"status": "error", "message": "File not found on any server"}), 404
         
+    # Enforce visibility check
+    is_owner = file_record['owner_id'] == g.user['id']
+    if not is_owner:
+        if file_record['visibility'] == 'private':
+            return jsonify({"status": "error", "message": "Access denied: file is private"}), 403
+        elif file_record['visibility'] == 'shared':
+            from database import get_connection
+            conn = get_connection()
+            try:
+                shared = conn.execute(
+                    "SELECT 1 FROM file_shares WHERE file_id = ? AND shared_with_user_id = ?",
+                    (file_record['id'], g.user['id'])
+                ).fetchone()
+                if not shared:
+                    return jsonify({"status": "error", "message": "Access denied: file is not shared with you"}), 403
+            finally:
+                conn.close()
+
     host = REPLICA_HOST if g.primary_down else PRIMARY_HOST
     port = REPLICA_PORT if g.primary_down else PRIMARY_PORT
     
@@ -803,12 +911,95 @@ def get_quota():
         "pct": pct
     })
 
+@app.route('/folders', methods=['POST'])
+@login_required
+def create_folder():
+    if g.primary_down:
+        return jsonify({
+            "status": "error", 
+            "message": "Primary server is offline. Write operations are unavailable in failover mode."
+        }), 503
+
+    name = request.form.get('name')
+    if not name and request.is_json:
+        name = request.json.get('name')
+        
+    if not name or not name.strip():
+        return jsonify({"status": "error", "message": "Folder name is required"}), 400
+
+    parent_folder_id_str = request.form.get('parent_folder_id')
+    if not parent_folder_id_str and request.is_json:
+        parent_folder_id_str = request.json.get('parent_folder_id')
+
+    parent_folder_id = None
+    if parent_folder_id_str and parent_folder_id_str != 'None' and parent_folder_id_str != '':
+        try:
+            parent_folder_id = int(parent_folder_id_str)
+            # Load parent_folder_id and reject it unless the folder exists and is owned by g.user['id']
+            parent_folder = auth.get_folder_by_id(parent_folder_id)
+            if not parent_folder:
+                return jsonify({"status": "error", "message": "Parent folder not found"}), 404
+            if parent_folder['owner_id'] != g.user['id']:
+                return jsonify({"status": "error", "message": "Permission denied: parent folder owned by another user"}), 403
+        except ValueError:
+            return jsonify({"status": "error", "message": "Invalid parent folder ID"}), 400
+
+    try:
+        folder_id = auth.create_folder(name, g.user['id'], parent_folder_id)
+        msg = "Folder created successfully."
+        flash(msg, "success")
+        return jsonify({"status": "success", "message": msg, "folder_id": folder_id}), 200
+    except ValueError as e:
+        err_msg = str(e)
+        if "does not exist" in err_msg or "not found" in err_msg.lower():
+            return jsonify({"status": "error", "message": err_msg}), 404
+        if "another user" in err_msg or "permission denied" in err_msg.lower():
+            return jsonify({"status": "error", "message": err_msg}), 403
+        return jsonify({"status": "error", "message": err_msg}), 400
+    except Exception as e:
+        return jsonify({"status": "error", "message": "Failed to create folder"}), 500
+
+
+@app.route('/folders/<int:folder_id>/delete', methods=['POST'])
+@login_required
+def delete_folder(folder_id):
+    if g.primary_down:
+        return jsonify({
+            "status": "error", 
+            "message": "Primary server is offline. Write operations are unavailable in failover mode."
+        }), 503
+
+    folder = auth.get_folder_by_id(folder_id)
+    if not folder:
+        return jsonify({"status": "error", "message": "Folder not found"}), 404
+
+    if folder['owner_id'] != g.user['id']:
+        return jsonify({"status": "error", "message": "You can only delete folders you own."}), 403
+
+    try:
+        auth.delete_folder(folder_id, g.user['id'])
+        msg = "Folder deleted successfully."
+        flash(msg, "success")
+        return jsonify({"status": "success", "message": msg}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": "Delete failed"}), 500
+
+
 @app.route('/files')
 @login_required
 def list_files():
     search = request.args.get('search', '').strip()
     file_type = request.args.get('type', '').strip()
-    files = auth.get_filtered_files(search=search, file_type=file_type)
+    
+    folder_id_str = request.args.get('folder_id')
+    folder_id = None
+    if folder_id_str and folder_id_str != 'None' and folder_id_str != '':
+        try:
+            folder_id = int(folder_id_str)
+        except ValueError:
+            return jsonify({"status": "error", "message": "Invalid folder ID"}), 400
+
+    files = auth.get_visible_files_for_user(g.user['id'], folder_id=folder_id, search=search, file_type=file_type)
     formatted_files = []
     for f in files:
         formatted_files.append({
@@ -818,7 +1009,9 @@ def list_files():
             "type": f['file_type'],
             "uploaded": f['uploaded_at'].split('T')[0] if 'T' in f['uploaded_at'] else f['uploaded_at'],
             "owner": f['owner_username'],
-            "owner_id": f['owner_id']
+            "owner_id": f['owner_id'],
+            "visibility": f['visibility'],
+            "share_token": f['share_token']
         })
     return jsonify({"files": formatted_files})
 
@@ -844,6 +1037,215 @@ def profile():
             member_since = created_at_str
             
     return render_template('profile.html', active_page='profile', user=user, member_since=member_since)
+
+
+@app.route('/share/<filename>', methods=['GET', 'POST'])
+@login_required
+def share_file(filename):
+    file_record = auth.get_file_by_name(filename)
+    if not file_record:
+        return jsonify({"status": "error", "message": "File not found"}), 404
+        
+    if file_record['owner_id'] != g.user['id']:
+        return jsonify({"status": "error", "message": "You can only share files you own."}), 403
+        
+    if request.method == 'POST':
+        if g.primary_down:
+            return jsonify({
+                "status": "error", 
+                "message": "Primary server is offline. Write operations are unavailable in failover mode."
+            }), 503
+
+        # Parse visibility
+        visibility = None
+        if request.is_json and request.json:
+            visibility = request.json.get('visibility')
+        else:
+            visibility = request.form.get('visibility')
+            
+        if not visibility:
+            return jsonify({"status": "error", "message": "Visibility is required"}), 400
+        
+        if visibility not in ('private', 'public', 'shared'):
+            return jsonify({"status": "error", "message": "Visibility must be 'private', 'public', or 'shared'"}), 400
+            
+        # Parse usernames
+        usernames_str = ""
+        if request.is_json and request.json:
+            usernames_val = request.json.get('usernames', '') or request.json.get('shared_users', '')
+            if isinstance(usernames_val, list):
+                usernames_list = [u.strip() for u in usernames_val if u.strip()]
+            else:
+                usernames_str = usernames_val or ""
+                usernames_list = [u.strip() for u in usernames_str.split(',') if u.strip()]
+        else:
+            usernames_str = request.form.get('usernames', '') or request.form.get('shared_users', '') or ""
+            usernames_list = [u.strip() for u in usernames_str.split(',') if u.strip()]
+            
+        try:
+            share_token = auth.update_file_sharing(filename, g.user['id'], visibility, usernames_list)
+        except ValueError as e:
+            return jsonify({"status": "error", "message": str(e)}), 400
+            
+        flash("Sharing settings updated.", "success")
+        return jsonify({
+            "status": "success",
+            "message": "Sharing settings updated successfully.",
+            "visibility": visibility,
+            "share_token": share_token,
+            "shared_users": usernames_list
+        }), 200
+        
+    else:
+        # GET request: return sharing info
+        from database import get_connection
+        conn = get_connection()
+        try:
+            current_shares = conn.execute(
+                """
+                SELECT u.username
+                FROM file_shares fs
+                JOIN users u ON fs.shared_with_user_id = u.id
+                WHERE fs.file_id = ?
+                """,
+                (file_record['id'],)
+            ).fetchall()
+            current_usernames = [row['username'] for row in current_shares]
+        finally:
+            conn.close()
+            
+        return jsonify({
+            "status": "success",
+            "visibility": file_record['visibility'],
+            "share_token": file_record['share_token'],
+            "shared_users": current_usernames
+        }), 200
+
+
+@app.route('/shared/<token>')
+def download_shared_file(token):
+    file_record = auth.get_file_by_share_token(token)
+    if not file_record:
+        return "File not found", 404
+        
+    if file_record['visibility'] != 'public':
+        return "Access denied", 403
+        
+    if request.args.get('download') == 'true':
+        filename = file_record['filename']
+        host = REPLICA_HOST if g.primary_down else PRIMARY_HOST
+        port = REPLICA_PORT if g.primary_down else PRIMARY_PORT
+        
+        failover_triggered = False
+        s = None
+        leftover = b''
+        try:
+            s = connect_and_authenticate(host, port, timeout=5)
+            s.sendall(f"DOWNLOAD {filename}\n".encode('utf-8'))
+            
+            resp_line, leftover = read_line_buffered(s)
+            if not resp_line:
+                raise socket.error("Header read failure: empty response")
+                
+            if not resp_line.startswith("OK "):
+                s.close()
+                if "FILE_NOT_FOUND" in resp_line:
+                    return "File not found", 404
+                if "INVALID_FILENAME" in resp_line:
+                    return "Invalid filename", 400
+                if "INVALID_COMMAND" in resp_line:
+                    return "Invalid command", 400
+                return f"Download failed: {resp_line}", 500
+                
+            parts = resp_line.split()
+            file_size = int(parts[1])
+            s.settimeout(None)
+            
+        except Exception as e:
+            if s:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            
+            if host == PRIMARY_HOST:
+                g.primary_down = True
+                global PRIMARY_DOWN
+                PRIMARY_DOWN = True
+                session['primary_down'] = True
+                failover_triggered = True
+                
+                host = REPLICA_HOST
+                port = REPLICA_PORT
+                s = None
+                try:
+                    s = connect_and_authenticate(host, port, timeout=5)
+                    s.sendall(f"DOWNLOAD {filename}\n".encode('utf-8'))
+                    
+                    resp_line, leftover = read_line_buffered(s)
+                    if not resp_line:
+                        raise socket.error("Header read failure: empty response")
+                        
+                    if not resp_line.startswith("OK "):
+                        s.close()
+                        if "FILE_NOT_FOUND" in resp_line:
+                            return "File not found", 404
+                        return f"Download failed: {resp_line}", 500
+                        
+                    parts = resp_line.split()
+                    file_size = int(parts[1])
+                    s.settimeout(None)
+                except Exception as replica_e:
+                    if s:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
+                    return "Failed to connect to file server.", 500
+            else:
+                return "Failed to connect to file server.", 500
+            
+        def generate_bytes(sock, size, initial_bytes=b''):
+            try:
+                bytes_left = size
+                if initial_bytes:
+                    to_send = initial_bytes[:bytes_left]
+                    yield to_send
+                    bytes_left -= len(to_send)
+                chunk_size = 65536
+                while bytes_left > 0:
+                    to_read = min(chunk_size, bytes_left)
+                    chunk = sock.recv(to_read)
+                    if not chunk:
+                        break
+                    yield chunk
+                    bytes_left -= len(chunk)
+            finally:
+                sock.close()
+                
+        import mimetypes
+        mime_type, _ = mimetypes.guess_type(file_record['original_name'])
+        if not mime_type:
+            mime_type = 'application/octet-stream'
+            
+        display_name = file_record['original_name']
+        _, disp_ext = os.path.splitext(display_name)
+        _, stored_ext = os.path.splitext(file_record['filename'])
+        if stored_ext and not disp_ext:
+            display_name = display_name + stored_ext
+        safe_display_name = display_name.replace('"', '\\"')
+        
+        headers = {
+            'Content-Type': mime_type,
+            'Content-Disposition': f'attachment; filename="{safe_display_name}"',
+            'Content-Length': str(file_size)
+        }
+        
+        response = Response(generate_bytes(s, file_size, leftover), headers=headers)
+        return response
+    else:
+        return render_template('shared.html', file=file_record)
+
 
 if __name__ == '__main__':
     # Default Flask port is 5000

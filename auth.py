@@ -16,6 +16,11 @@ update_quota(user_id, delta_bytes)        → None
 
 # File metadata (re-exported from database for backwards compatibility)
 add_file, get_file_by_name, delete_file, rename_file, get_all_files
+
+# Folders & Sharing (re-exported from database)
+create_folder, get_folders_for_user, delete_folder, get_files_in_folder, get_subfolders
+set_file_visibility, add_file_share, remove_file_share, get_file_by_share_token
+get_visible_files_for_user
 """
 
 from __future__ import annotations
@@ -38,6 +43,20 @@ from database import (
     get_all_files,
     get_filtered_files,
     delete_file_and_decrement_quota,
+    create_folder,
+    get_folders_for_user,
+    delete_folder,
+    get_files_in_folder,
+    set_file_visibility,
+    add_file_share,
+    remove_file_share,
+    get_file_by_share_token,
+    get_file_shares,
+    get_visible_files_for_user,
+    get_folder_by_id,
+    get_folder_path,
+    get_subfolders,
+    update_file_sharing,
 )
 
 

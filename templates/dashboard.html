@@ -378,6 +378,24 @@
         border-color: rgba(99, 102, 241, 0.2);
     }
 
+    .badge-public {
+        background: rgba(16, 185, 129, 0.15);
+        color: #34d399;
+        border-color: rgba(16, 185, 129, 0.3);
+    }
+
+    .badge-private {
+        background: rgba(156, 163, 175, 0.15);
+        color: #9ca3af;
+        border-color: rgba(156, 163, 175, 0.3);
+    }
+
+    .badge-shared {
+        background: rgba(245, 158, 11, 0.15);
+        color: #fbbf24;
+        border-color: rgba(245, 158, 11, 0.3);
+    }
+
     .owner-tag {
         color: var(--text-secondary);
         font-weight: 500;
@@ -516,6 +534,10 @@
         background: linear-gradient(90deg, var(--danger), var(--warning));
     }
 
+    .modal-share::before {
+        background: linear-gradient(90deg, var(--accent), var(--success));
+    }
+
     .modal-header {
         margin-bottom: 1.5rem;
     }
@@ -638,6 +660,21 @@
         box-shadow: 0 0 10px var(--accent-glow);
         background: rgba(255, 255, 255, 0.08);
     }
+    
+    .breadcrumb-link:hover {
+        color: #fff !important;
+        text-shadow: 0 0 10px var(--accent-glow);
+    }
+    .clickable-row {
+        cursor: pointer;
+        transition: background-color 0.2s ease;
+    }
+    .clickable-row:hover td {
+        background: rgba(255, 255, 255, 0.03) !important;
+    }
+    .modal-folder::before {
+        background: linear-gradient(90deg, var(--accent), var(--success)) !important;
+    }
 </style>
 {% endblock %}
 
@@ -656,11 +693,33 @@
             <div style="font-size: 0.85rem; color: var(--text-secondary);">
                 Logged in as: <span style="color: var(--accent); font-weight: 600;" id="logged-in-username">{{ g.user.username }}</span>
             </div>
-            <button class="btn btn-primary" id="header-upload-btn" style="width: auto; padding: 0.5rem 1rem; font-size: 0.9rem;">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 4px; vertical-align: middle;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
-                Upload File
-            </button>
+            <div style="display: flex; gap: 0.5rem;">
+                <button class="btn btn-secondary" id="new-folder-btn" data-element-id="new-folder-btn" style="width: auto; padding: 0.5rem 1rem; font-size: 0.9rem; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--glass-border); color: #fff;">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 4.5px; vertical-align: middle;"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                    New Folder
+                </button>
+                <button class="btn btn-primary" id="header-upload-btn" style="width: auto; padding: 0.5rem 1rem; font-size: 0.9rem;">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 4px; vertical-align: middle;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
+                    Upload File
+                </button>
+            </div>
         </div>
+    </div>
+
+    <!-- Breadcrumb path container -->
+    <div class="breadcrumb-container" style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1.5rem; font-size: 0.95rem; font-weight: 500; color: var(--text-secondary);">
+        <a href="/dashboard" class="breadcrumb-link" style="color: var(--accent); text-decoration: none; display: flex; align-items: center; gap: 0.25rem; transition: var(--transition);">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+            Root
+        </a>
+        {% for crumb in breadcrumbs %}
+            <span style="color: var(--glass-border);">/</span>
+            {% if not loop.last %}
+                <a href="/dashboard?folder_id={{ crumb.id }}" class="breadcrumb-link" style="color: var(--accent); text-decoration: none; transition: var(--transition);">{{ crumb.name }}</a>
+            {% else %}
+                <span style="color: var(--text-primary);">{{ crumb.name }}</span>
+            {% endif %}
+        {% endfor %}
     </div>
 
     <div class="dashboard-grid" id="dashboard-layout-grid">
@@ -758,19 +817,69 @@
                 </div>
 
                 <div class="files-table-wrapper" id="files-table-scroller">
-                    {% if files %}
+                    {% if files or folders %}
                         <table class="files-table" id="files-data-table">
                             <thead>
                                 <tr>
                                     <th>Name</th>
                                     <th>Size</th>
                                     <th>Type</th>
+                                    <th>Visibility</th>
                                     <th>Uploaded</th>
                                     <th>Owner</th>
                                     <th style="text-align: right;">Actions</th>
                                 </tr>
                             </thead>
                             <tbody>
+                                <!-- Folders Rows -->
+                                {% for folder in folders %}
+                                    {% set folder_index = loop.index %}
+                                    <tr id="folder-row-{{ folder_index }}" class="folder-table-row clickable-row" data-href="/dashboard?folder_id={{ folder.id }}">
+                                        <td>
+                                            <div class="file-name-cell">
+                                                <div class="file-icon-container" style="background: rgba(245, 158, 11, 0.1); color: rgb(245, 158, 11);" id="folder-icon-{{ folder_index }}">
+                                                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                                                </div>
+                                                <div class="file-title-wrapper">
+                                                    <span class="file-title" title="{{ folder.name }}" id="folder-title-{{ folder_index }}">{{ folder.name }}</span>
+                                                </div>
+                                            </div>
+                                        </td>
+                                        <td class="file-size-col">—</td>
+                                        <td class="file-type-col">Folder</td>
+                                        <td class="file-visibility-col">—</td>
+                                        <td>
+                                            {% if 'T' in folder.created_at %}
+                                                {{ folder.created_at.split('T')[0] }}
+                                            {% else %}
+                                                {{ folder.created_at }}
+                                            {% endif %}
+                                        </td>
+                                        <td>
+                                            {% if folder.owner_id == g.user.id %}
+                                                <span class="badge badge-owner-you" id="folder-owner-badge-{{ folder_index }}">You</span>
+                                            {% else %}
+                                                <span class="owner-tag" id="folder-owner-tag-{{ folder_index }}">{{ folder.owner_username }}</span>
+                                            {% endif %}
+                                        </td>
+                                        <td>
+                                            {% if folder.owner_id == g.user.id %}
+                                            <div class="file-actions" id="folder-actions-{{ folder_index }}">
+                                                <button type="button" class="action-button btn-delete-folder-trigger btn-delete-folder" title="Delete Folder" data-id="{{ folder.id }}" data-name="{{ folder.name }}" data-index="{{ folder_index }}" id="delete-folder-btn-{{ folder_index }}">
+                                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+                                                </button>
+                                            </div>
+                                            <div class="delete-folder-confirm-inline" id="delete-folder-confirm-{{ folder_index }}" style="display: none; align-items: center; justify-content: flex-end; gap: 0.5rem; white-space: nowrap;">
+                                                <span style="font-size: 0.8rem; color: var(--danger); margin-right: 0.25rem;">Delete?</span>
+                                                <button type="button" class="action-button btn-confirm-delete-folder btn-delete" style="width: auto; height: 28px; padding: 0 8px; font-size: 0.8rem; font-weight: 600;" data-id="{{ folder.id }}" data-index="{{ folder_index }}" id="confirm-delete-folder-{{ folder_index }}">Confirm</button>
+                                                <button type="button" class="action-button btn-cancel-delete-folder btn-secondary" style="width: auto; height: 28px; padding: 0 8px; font-size: 0.8rem; font-weight: 600;" data-index="{{ folder_index }}" id="cancel-delete-folder-{{ folder_index }}">Cancel</button>
+                                            </div>
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                {% endfor %}
+
+                                <!-- Files Rows -->
                                 {% for file in files %}
                                     {% set file_index = loop.index %}
                                     <tr id="file-row-{{ file_index }}" class="file-table-row">
@@ -801,6 +910,9 @@
                                         <td class="file-type-col" id="file-type-{{ file_index }}">
                                             {% if file.file_type == 'pdf' %}PDF{% else %}{{ file.file_type|capitalize }}{% endif %}
                                         </td>
+                                        <td id="file-visibility-{{ file_index }}">
+                                            <span class="badge badge-{{ file.visibility }}">{{ file.visibility|capitalize }}</span>
+                                        </td>
                                         <td id="file-uploaded-{{ file_index }}">
                                             {% if 'T' in file.uploaded_at %}
                                                 {{ file.uploaded_at.split('T')[0] }}
@@ -821,6 +933,9 @@
                                                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
                                                 </button>
                                                 {% if file.owner_id == g.user.id %}
+                                                    <button type="button" class="action-button btn-share-trigger" title="Share File" data-filename="{{ file.filename }}" data-originalname="{{ file.original_name }}" data-visibility="{{ file.visibility }}" data-sharetoken="{{ file.share_token or '' }}" id="share-btn-{{ file_index }}">
+                                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"></path><polyline points="16 6 12 2 8 6"></polyline><line x1="12" y1="2" x2="12" y2="15"></line></svg>
+                                                    </button>
                                                     <button type="button" class="action-button btn-rename-trigger" title="Rename File" data-filename="{{ file.filename }}" data-originalname="{{ file.original_name }}" id="rename-btn-{{ file_index }}">
                                                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
                                                     </button>
@@ -883,6 +998,91 @@
             <div class="modal-footer" id="rename-modal-footer">
                 <button type="button" class="btn btn-secondary btn-modal" id="rename-cancel-btn">Cancel</button>
                 <button type="submit" class="btn btn-warning btn-modal" id="rename-submit-btn">Rename File</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- New Folder Modal -->
+<div class="modal modal-folder" id="new-folder-modal">
+    <div class="modal-card">
+        <div class="modal-header">
+            <h2 class="modal-title" style="display: flex; align-items: center; gap: 0.5rem;">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                Create New Folder
+            </h2>
+        </div>
+        <form id="new-folder-form">
+            <input type="hidden" name="parent_folder_id" value="{{ current_folder_id or '' }}">
+            <div class="modal-body">
+                <p style="margin-bottom: 1rem;">Enter a name for the new folder.</p>
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label for="folder-name-input" class="form-label">Folder Name</label>
+                    <input type="text" id="folder-name-input" name="name" class="form-input" required autocomplete="off" placeholder="Enter folder name...">
+                    <div class="error-message" id="new-folder-error-msg" style="display: none; color: var(--danger); font-size: 0.85rem; margin-top: 0.5rem; font-weight: 500;"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary btn-modal" id="new-folder-cancel-btn">Cancel</button>
+                <button type="submit" class="btn btn-primary btn-modal" id="new-folder-submit-btn">Create Folder</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Share Modal -->
+<div class="modal modal-share" id="share-modal">
+    <div class="modal-card" style="max-width: 500px;">
+        <div class="modal-header">
+            <h2 class="modal-title" style="display: flex; align-items: center; gap: 0.5rem;">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"></path><polyline points="16 6 12 2 8 6"></polyline><line x1="12" y1="2" x2="12" y2="15"></line></svg>
+                Share File
+            </h2>
+        </div>
+        <form id="share-form">
+            <input type="hidden" id="share-target-filename" name="filename">
+            <div class="modal-body">
+                <p style="margin-bottom: 1.25rem;">Adjust the visibility and sharing settings for <span id="share-original-label" style="font-weight: 600; color: #fff;">file</span>.</p>
+                
+                <div class="form-group">
+                    <label class="form-label">Visibility</label>
+                    <div style="display: flex; flex-direction: column; gap: 0.75rem; margin-top: 0.5rem;">
+                        <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; color: var(--text-primary); font-weight: 500;">
+                            <input type="radio" name="visibility" value="private" id="vis-private" checked style="accent-color: var(--accent);">
+                            <span>🔒 Private — only you can access</span>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; color: var(--text-primary); font-weight: 500;">
+                            <input type="radio" name="visibility" value="public" id="vis-public" style="accent-color: var(--accent);">
+                            <span>🌐 Public — anyone with the link can download</span>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; color: var(--text-primary); font-weight: 500;">
+                            <input type="radio" name="visibility" value="shared" id="vis-shared" style="accent-color: var(--accent);">
+                            <span>👥 Shared — only specific users can access</span>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Shared Users Field (Only shown in Shared mode) -->
+                <div class="form-group" id="shared-users-container" style="display: none; margin-top: 1.25rem;">
+                    <label for="shared-users-input" class="form-label">Shared Users (comma-separated usernames)</label>
+                    <input type="text" id="shared-users-input" class="form-input" placeholder="e.g. alice, bob, charlie" autocomplete="off">
+                    <p style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem;">Users listed here will be able to view and download this file from their dashboard.</p>
+                </div>
+
+                <!-- Public Link Field (Only shown in Public mode) -->
+                <div class="form-group" id="public-link-container" style="display: none; margin-top: 1.25rem;">
+                    <label class="form-label">Share Link</label>
+                    <div style="display: flex; gap: 0.5rem; margin-top: 0.5rem;">
+                        <input type="text" id="share-link-input" class="form-input" readonly style="background: rgba(255, 255, 255, 0.05); color: var(--text-secondary); cursor: text;">
+                        <button type="button" class="btn btn-primary" id="copy-link-btn" style="width: auto; padding: 0.5rem 1rem; font-size: 0.9rem;">Copy</button>
+                    </div>
+                </div>
+
+                <div class="error-message" id="share-error-msg" style="display: none; color: var(--danger); font-size: 0.85rem; margin-top: 0.5rem; font-weight: 500;"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary btn-modal" id="share-cancel-btn">Cancel</button>
+                <button type="submit" class="btn btn-primary btn-modal" id="share-submit-btn">Save Changes</button>
             </div>
         </form>
     </div>
@@ -1015,6 +1215,110 @@
             renameErrorMsg.textContent = '';
         }
         renameForm.reset();
+    }
+
+    // --- Share Modal helpers ---
+    function openShareModal(filename, originalName) {
+        const shareModal = document.getElementById('share-modal');
+        const shareTargetFilename = document.getElementById('share-target-filename');
+        const shareOriginalLabel = document.getElementById('share-original-label');
+        const shareErrorMsg = document.getElementById('share-error-msg');
+        
+        shareTargetFilename.value = filename;
+        shareOriginalLabel.textContent = originalName;
+        
+        if (shareErrorMsg) {
+            shareErrorMsg.style.display = 'none';
+            shareErrorMsg.textContent = '';
+        }
+        
+        const encodedFilename = encodeURIComponent(filename);
+        fetch(`/share/${encodedFilename}?t=${Date.now()}`)
+            .then(res => {
+                if (!res.ok) throw new Error('Failed to load sharing settings');
+                return res.json();
+            })
+            .then(data => {
+                const shareForm = document.getElementById('share-form');
+                shareForm.dataset.shareToken = data.share_token || '';
+                shareForm.dataset.sharedUsers = (data.shared_users || []).join(', ');
+                
+                const visPrivate = document.getElementById('vis-private');
+                const visPublic = document.getElementById('vis-public');
+                const visShared = document.getElementById('vis-shared');
+                
+                if (data.visibility === 'private') {
+                    visPrivate.checked = true;
+                } else if (data.visibility === 'public') {
+                    visPublic.checked = true;
+                } else if (data.visibility === 'shared') {
+                    visShared.checked = true;
+                }
+                
+                toggleShareContainers(data.visibility, data.share_token, data.shared_users);
+                shareModal.classList.add('active');
+            })
+            .catch(err => {
+                showDynamicAlert(err.message, 'error');
+            });
+    }
+
+    function toggleShareContainers(visibility, shareToken, sharedUsers) {
+        const sharedUsersContainer = document.getElementById('shared-users-container');
+        const publicLinkContainer = document.getElementById('public-link-container');
+        const sharedUsersInput = document.getElementById('shared-users-input');
+        const shareLinkInput = document.getElementById('share-link-input');
+        
+        if (visibility === 'shared') {
+            sharedUsersContainer.style.display = 'block';
+            publicLinkContainer.style.display = 'none';
+            if (sharedUsers) {
+                sharedUsersInput.value = sharedUsers.join(', ');
+            } else {
+                sharedUsersInput.value = '';
+            }
+        } else if (visibility === 'public') {
+            sharedUsersContainer.style.display = 'none';
+            publicLinkContainer.style.display = 'block';
+            if (shareToken) {
+                shareLinkInput.value = window.location.origin + '/shared/' + shareToken;
+            } else {
+                shareLinkInput.value = 'Link will be generated when you save changes';
+            }
+        } else {
+            sharedUsersContainer.style.display = 'none';
+            publicLinkContainer.style.display = 'none';
+        }
+    }
+
+    function closeShareModal() {
+        const shareModal = document.getElementById('share-modal');
+        const shareErrorMsg = document.getElementById('share-error-msg');
+        const shareForm = document.getElementById('share-form');
+        shareModal.classList.remove('active');
+        if (shareErrorMsg) {
+            shareErrorMsg.style.display = 'none';
+            shareErrorMsg.textContent = '';
+            shareErrorMsg.style.color = ''; // reset to default
+        }
+        
+        // Reset submit button display and cancel button text
+        const submitBtn = document.getElementById('share-submit-btn');
+        if (submitBtn) {
+            submitBtn.style.display = '';
+        }
+        const cancelBtn = document.getElementById('share-cancel-btn');
+        if (cancelBtn) {
+            cancelBtn.textContent = 'Cancel';
+        }
+        
+        const needsReload = shareForm.dataset.needsReload === 'true';
+        shareForm.reset();
+        delete shareForm.dataset.needsReload;
+        
+        if (needsReload) {
+            setTimeout(() => location.reload(), 100);
+        }
     }
 
     // --- Inline Delete helpers ---
@@ -1225,6 +1529,10 @@
 
                 const formData = new FormData();
                 formData.append('file', file);
+                const currentFolderId = '{{ current_folder_id or "" }}';
+                if (currentFolderId) {
+                    formData.append('folder_id', currentFolderId);
+                }
 
                 if (uploadBtn) uploadBtn.disabled = true;
                 if (headerUploadBtn) headerUploadBtn.disabled = true;
@@ -1312,6 +1620,13 @@
             openRenameModal(filename, originalName);
         }
 
+        function shareTriggerHandler(e) {
+            e.preventDefault();
+            const filename = this.getAttribute('data-filename');
+            const originalName = this.getAttribute('data-originalname');
+            openShareModal(filename, originalName);
+        }
+
         function deleteTriggerHandler(e) {
             e.preventDefault();
             const index = this.getAttribute('data-index');
@@ -1331,10 +1646,88 @@
             executeInlineDelete(filename, index);
         }
 
+        // --- Folder actions and row click navigation ---
+        function rowClickHandler(e) {
+            if (e.target.closest('.file-actions') || e.target.closest('.delete-folder-confirm-inline') || e.target.closest('button')) {
+                return;
+            }
+            window.location.href = this.dataset.href;
+        }
+
+        function deleteFolderTriggerHandler(e) {
+            e.preventDefault();
+            const index = this.getAttribute('data-index');
+            showFolderInlineDeletePrompt(index);
+        }
+
+        function cancelFolderDeleteHandler(e) {
+            e.preventDefault();
+            const index = this.getAttribute('data-index');
+            cancelFolderInlineDelete(index);
+        }
+
+        function confirmFolderDeleteHandler(e) {
+            e.preventDefault();
+            const id = this.getAttribute('data-id');
+            const index = this.getAttribute('data-index');
+            executeFolderDelete(id, index);
+        }
+
+        function showFolderInlineDeletePrompt(index) {
+            document.querySelectorAll('.delete-folder-confirm-inline').forEach(el => el.style.display = 'none');
+            document.querySelectorAll('.clickable-row .file-actions').forEach(el => {
+                if (el.id.startsWith('folder-actions-')) el.style.display = 'flex';
+            });
+            const actionsDiv = document.getElementById(`folder-actions-${index}`);
+            if (actionsDiv) actionsDiv.style.display = 'none';
+            const confirmDiv = document.getElementById(`delete-folder-confirm-${index}`);
+            if (confirmDiv) confirmDiv.style.display = 'flex';
+        }
+
+        function cancelFolderInlineDelete(index) {
+            const confirmDiv = document.getElementById(`delete-folder-confirm-${index}`);
+            if (confirmDiv) confirmDiv.style.display = 'none';
+            const actionsDiv = document.getElementById(`folder-actions-${index}`);
+            if (actionsDiv) actionsDiv.style.display = 'flex';
+        }
+
+        function executeFolderDelete(id, index) {
+            const confirmBtn = document.getElementById(`confirm-delete-folder-${index}`);
+            const cancelBtn = document.getElementById(`cancel-delete-folder-${index}`);
+            if (confirmBtn) confirmBtn.disabled = true;
+            if (cancelBtn) cancelBtn.disabled = true;
+
+            fetch(`/folders/${id}/delete`, { method: 'POST' })
+            .then(res => {
+                const primaryDown = res.headers.get('X-Primary-Down') === 'true';
+                if (primaryDown && typeof updateFailoverUI === 'function') {
+                    document.cookie = "primary_down=true; path=/; SameSite=Lax";
+                    updateFailoverUI(true);
+                }
+                if (!res.ok) {
+                    return res.json().then(data => { throw new Error(data.message || 'Delete failed'); });
+                }
+                return res.json();
+            })
+            .then(() => {
+                setTimeout(() => location.reload(), 100);
+            })
+            .catch(err => {
+                showDynamicAlert(err.message, 'error');
+                if (confirmBtn) confirmBtn.disabled = false;
+                if (cancelBtn) cancelBtn.disabled = false;
+                cancelFolderInlineDelete(index);
+            });
+        }
+
         function bindActionButtons() {
             document.querySelectorAll('.btn-download').forEach(btn => {
                 btn.removeEventListener('click', downloadHandler);
                 btn.addEventListener('click', downloadHandler);
+            });
+            document.querySelectorAll('.btn-share-trigger').forEach(btn => {
+                btn.removeEventListener('click', shareTriggerHandler);
+                btn.addEventListener('click', shareTriggerHandler);
             });
             document.querySelectorAll('.btn-rename-trigger').forEach(btn => {
                 btn.removeEventListener('click', renameTriggerHandler);
@@ -1351,6 +1744,26 @@
             document.querySelectorAll('.btn-confirm-delete').forEach(btn => {
                 btn.removeEventListener('click', confirmDeleteHandler);
                 btn.addEventListener('click', confirmDeleteHandler);
+            });
+            
+            // Folder action bindings
+            document.querySelectorAll('.btn-delete-folder-trigger').forEach(btn => {
+                btn.removeEventListener('click', deleteFolderTriggerHandler);
+                btn.addEventListener('click', deleteFolderTriggerHandler);
+            });
+            document.querySelectorAll('.btn-cancel-delete-folder').forEach(btn => {
+                btn.removeEventListener('click', cancelFolderDeleteHandler);
+                btn.addEventListener('click', cancelFolderDeleteHandler);
+            });
+            document.querySelectorAll('.btn-confirm-delete-folder').forEach(btn => {
+                btn.removeEventListener('click', confirmFolderDeleteHandler);
+                btn.addEventListener('click', confirmFolderDeleteHandler);
+            });
+
+            // Clickable row bindings
+            document.querySelectorAll('.clickable-row').forEach(row => {
+                row.removeEventListener('click', rowClickHandler);
+                row.addEventListener('click', rowClickHandler);
             });
         }
 
@@ -1417,12 +1830,132 @@
             });
         }
 
+        const shareCancelBtn = document.getElementById('share-cancel-btn');
+        if (shareCancelBtn) shareCancelBtn.addEventListener('click', closeShareModal);
+
+        const copyBtn = document.getElementById('copy-link-btn');
+        const linkInput = document.getElementById('share-link-input');
+        if (copyBtn && linkInput) {
+            copyBtn.addEventListener('click', () => {
+                if (!linkInput.value || linkInput.value.includes('Link will be generated')) {
+                    showDynamicAlert('Please click "Save Changes" to generate the link first.', 'error');
+                    return;
+                }
+                navigator.clipboard.writeText(linkInput.value).then(() => {
+                    const originalText = copyBtn.textContent;
+                    copyBtn.textContent = 'Copied!';
+                    copyBtn.style.background = 'var(--success)';
+                    setTimeout(() => {
+                        copyBtn.textContent = originalText;
+                        copyBtn.style.background = '';
+                    }, 2000);
+                });
+            });
+        }
+
+        // Radio buttons change listener
+        document.querySelectorAll('input[name="visibility"]').forEach(radio => {
+            radio.addEventListener('change', (e) => {
+                const shareForm = document.getElementById('share-form');
+                const token = shareForm.dataset.shareToken;
+                const users = shareForm.dataset.sharedUsers ? shareForm.dataset.sharedUsers.split(', ') : [];
+                toggleShareContainers(e.target.value, token, users);
+            });
+        });
+
+        const shareForm = document.getElementById('share-form');
+        if (shareForm) {
+            shareForm.addEventListener('submit', (e) => {
+                e.preventDefault();
+                const shareTargetFilename = document.getElementById('share-target-filename');
+                const shareErrorMsg = document.getElementById('share-error-msg');
+                const visChecked = document.querySelector('input[name="visibility"]:checked');
+                const usernamesInput = document.getElementById('shared-users-input');
+                
+                const filename = shareTargetFilename.value;
+                const visibility = visChecked ? visChecked.value : 'private';
+                const usernames = usernamesInput ? usernamesInput.value.trim() : '';
+                
+                if (shareErrorMsg) {
+                    shareErrorMsg.style.display = 'none';
+                    shareErrorMsg.textContent = '';
+                }
+                
+                const encodedFilename = encodeURIComponent(filename);
+                
+                const params = { 'visibility': visibility };
+                if (visibility === 'shared') {
+                    params['usernames'] = usernames;
+                }
+                
+                fetch(`/share/${encodedFilename}?t=${Date.now()}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams(params)
+                })
+                .then(res => {
+                    const primaryDown = res.headers.get('X-Primary-Down') === 'true';
+                    if (primaryDown && typeof updateFailoverUI === 'function') {
+                        document.cookie = "primary_down=true; path=/; SameSite=Lax";
+                        updateFailoverUI(true);
+                    }
+                    if (!res.ok) {
+                        return res.json().then(data => { throw new Error(data.message || 'Failed to update sharing settings'); });
+                    }
+                    return res.json();
+                })
+                .then((data) => {
+                    if (visibility === 'public') {
+                        shareForm.dataset.shareToken = data.share_token || '';
+                        const shareLinkInput = document.getElementById('share-link-input');
+                        if (shareLinkInput && data.share_token) {
+                            shareLinkInput.value = window.location.origin + '/shared/' + data.share_token;
+                        }
+                        
+                        if (shareErrorMsg) {
+                            shareErrorMsg.textContent = 'Settings saved successfully! You can copy the link below.';
+                            shareErrorMsg.style.color = 'var(--success)';
+                            shareErrorMsg.style.display = 'block';
+                        }
+                        
+                        const submitBtn = document.getElementById('share-submit-btn');
+                        if (submitBtn) {
+                            submitBtn.style.display = 'none';
+                        }
+                        const cancelBtn = document.getElementById('share-cancel-btn');
+                        if (cancelBtn) {
+                            cancelBtn.textContent = 'Close';
+                        }
+                        shareForm.dataset.needsReload = 'true';
+                    } else {
+                        closeShareModal();
+                        setTimeout(() => location.reload(), 100);
+                    }
+                })
+                .catch(err => {
+                    if (shareErrorMsg) {
+                        shareErrorMsg.textContent = err.message || 'Failed to update sharing settings.';
+                        shareErrorMsg.style.display = 'block';
+                    } else {
+                        showDynamicAlert(err.message, 'error');
+                    }
+                });
+            });
+        }
+
         // --- Search & Filter (FE-4) ---
         const searchInput = document.getElementById('search-input');
         const typeFilter = document.getElementById('type-filter');
         const filesTableScroller = document.getElementById('files-table-scroller');
         const filesCounter = document.getElementById('files-counter');
         let debounceTimeout = null;
+
+        const currentFolders = {{ folders | tojson | safe if folders else '[]' }};
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+        }
 
         function updateFilesList() {
             const searchTerm = searchInput ? searchInput.value.trim() : '';
@@ -1441,7 +1974,11 @@
             }
             window.history.replaceState({}, '', currentUrl);
 
-            const url = `/files?search=${encodeURIComponent(searchTerm)}&type=${encodeURIComponent(typeTerm)}`;
+            const currentFolderId = '{{ current_folder_id or "" }}';
+            let url = `/files?search=${encodeURIComponent(searchTerm)}&type=${encodeURIComponent(typeTerm)}`;
+            if (currentFolderId) {
+                url += `&folder_id=${currentFolderId}`;
+            }
             
             fetch(url)
                 .then(res => {
@@ -1454,7 +1991,7 @@
                         filesCounter.textContent = `${files.length} file${files.length !== 1 ? 's' : ''}`;
                     }
 
-                    if (files.length === 0) {
+                    if (files.length === 0 && (!currentFolders.length || searchTerm)) {
                         filesTableScroller.innerHTML = `
                             <div class="empty-state" id="empty-files-state">
                                 <svg class="empty-state-icon" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -1474,6 +2011,7 @@
                                     <th>Name</th>
                                     <th>Size</th>
                                     <th>Type</th>
+                                    <th>Visibility</th>
                                     <th>Uploaded</th>
                                     <th>Owner</th>
                                     <th style="text-align: right;">Actions</th>
@@ -1481,6 +2019,51 @@
                             </thead>
                             <tbody>
                     `;
+
+                    // Prepend folders if no search search filter is active
+                    if (!searchTerm) {
+                        currentFolders.forEach((folder, index) => {
+                            const folderIndex = index + 1;
+                            const folderCreated = folder.created_at.includes('T') ? folder.created_at.split('T')[0] : folder.created_at;
+                            const isFolderOwner = folder.owner_id === parseInt('{{ g.user.id }}');
+                            const folderOwnerBadge = isFolderOwner 
+                                ? `<span class="badge badge-owner-you" id="folder-owner-badge-${folderIndex}">You</span>`
+                                : `<span class="owner-tag" id="folder-owner-tag-${folderIndex}">${escapeHtml(folder.owner_username)}</span>`;
+                            const folderActions = isFolderOwner
+                                ? `
+                                    <div class="file-actions" id="folder-actions-${folderIndex}">
+                                        <button type="button" class="action-button btn-delete-folder-trigger btn-delete-folder" title="Delete Folder" data-id="${folder.id}" data-name="${escapeHtml(folder.name)}" data-index="${folderIndex}" id="delete-folder-btn-${folderIndex}">
+                                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+                                        </button>
+                                    </div>
+                                    <div class="delete-folder-confirm-inline" id="delete-folder-confirm-${folderIndex}" style="display: none; align-items: center; justify-content: flex-end; gap: 0.5rem; white-space: nowrap;">
+                                        <span style="font-size: 0.8rem; color: var(--danger); margin-right: 0.25rem;">Delete?</span>
+                                        <button type="button" class="action-button btn-confirm-delete-folder btn-delete" style="width: auto; height: 28px; padding: 0 8px; font-size: 0.8rem; font-weight: 600;" data-id="${folder.id}" data-index="${folderIndex}" id="confirm-delete-folder-${folderIndex}">Confirm</button>
+                                        <button type="button" class="action-button btn-cancel-delete-folder btn-secondary" style="width: auto; height: 28px; padding: 0 8px; font-size: 0.8rem; font-weight: 600;" data-index="${folderIndex}" id="cancel-delete-folder-${folderIndex}">Cancel</button>
+                                    </div>`
+                                : '';
+                            tableHtml += `
+                                <tr id="folder-row-${folderIndex}" class="folder-table-row clickable-row" data-href="/dashboard?folder_id=${folder.id}">
+                                    <td>
+                                        <div class="file-name-cell">
+                                            <div class="file-icon-container" style="background: rgba(245, 158, 11, 0.1); color: rgb(245, 158, 11);" id="folder-icon-${folderIndex}">
+                                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+                                            </div>
+                                            <div class="file-title-wrapper">
+                                                <span class="file-title" title="${escapeHtml(folder.name)}" id="folder-title-${folderIndex}">${escapeHtml(folder.name)}</span>
+                                            </div>
+                                        </div>
+                                    </td>
+                                    <td class="file-size-col">—</td>
+                                    <td class="file-type-col">Folder</td>
+                                    <td>—</td>
+                                    <td>${folderCreated}</td>
+                                    <td>${folderOwnerBadge}</td>
+                                    <td>${folderActions}</td>
+                                </tr>
+                            `;
+                        });
+                    }
 
                     files.forEach((file, index) => {
                         const fileIndex = index + 1;
@@ -1506,6 +2089,9 @@
                             : `<span class="owner-tag" id="file-owner-tag-${fileIndex}">${file.owner}</span>`;
                         const ownerActions = isOwner
                             ? `
+                                <button type="button" class="action-button btn-share-trigger" title="Share File" data-filename="${file.name}" data-originalname="${file.original_name}" data-visibility="${file.visibility}" data-sharetoken="${file.share_token || ''}" id="share-btn-${fileIndex}">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"></path><polyline points="16 6 12 2 8 6"></polyline><line x1="12" y1="2" x2="12" y2="15"></line></svg>
+                                </button>
                                 <button type="button" class="action-button btn-rename-trigger" title="Rename File" data-filename="${file.name}" data-originalname="${file.original_name}" id="rename-btn-${fileIndex}">
                                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path><path d="M18.5 2.5a2.121 2.121 0 1 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path></svg>
                                 </button>
@@ -1537,6 +2123,9 @@
                                 </td>
                                 <td class="file-size-col" id="file-size-${fileIndex}">${file.size}</td>
                                 <td class="file-type-col" id="file-type-${fileIndex}">${typeName}</td>
+                                <td id="file-visibility-${fileIndex}">
+                                    <span class="badge badge-${file.visibility}">${file.visibility.charAt(0).toUpperCase() + file.visibility.slice(1)}</span>
+                                </td>
                                 <td id="file-uploaded-${fileIndex}">${file.uploaded}</td>
                                 <td>${ownerBadge}</td>
                                 <td>
@@ -1570,10 +2159,97 @@
         if (searchInput) searchInput.addEventListener('input', debouncedUpdate);
         if (typeFilter) typeFilter.addEventListener('change', updateFilesList);
 
+        // --- New Folder Modal Event Listeners ---
+        const newFolderModal = document.getElementById('new-folder-modal');
+        const newFolderForm = document.getElementById('new-folder-form');
+        const newFolderBtn = document.getElementById('new-folder-btn');
+        const newFolderCancelBtn = document.getElementById('new-folder-cancel-btn');
+        const newFolderInput = document.getElementById('folder-name-input');
+        const newFolderErrorMsg = document.getElementById('new-folder-error-msg');
+
+        if (newFolderBtn) {
+            newFolderBtn.addEventListener('click', () => {
+                newFolderModal.classList.add('active');
+                newFolderInput.focus();
+            });
+        }
+
+        if (newFolderCancelBtn) {
+            newFolderCancelBtn.addEventListener('click', () => {
+                newFolderModal.classList.remove('active');
+                newFolderInput.value = '';
+                newFolderErrorMsg.style.display = 'none';
+            });
+        }
+
+        if (newFolderForm) {
+            newFolderForm.addEventListener('submit', (e) => {
+                e.preventDefault();
+                const name = newFolderInput.value.trim();
+                const parentFolderId = newFolderForm.querySelector('input[name="parent_folder_id"]').value;
+                if (!name) return;
+
+                const formData = new FormData();
+                formData.append('name', name);
+                if (parentFolderId) {
+                    formData.append('parent_folder_id', parentFolderId);
+                }
+
+                fetch('/folders', {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(res => {
+                    const primaryDown = res.headers.get('X-Primary-Down') === 'true';
+                    if (primaryDown && typeof updateFailoverUI === 'function') {
+                        document.cookie = "primary_down=true; path=/; SameSite=Lax";
+                        updateFailoverUI(true);
+                    }
+                    if (!res.ok) {
+                        return res.json().then(data => { throw new Error(data.message || 'Failed to create folder'); });
+                    }
+                    return res.json();
+                })
+                .then(() => {
+                    newFolderModal.classList.remove('active');
+                    newFolderInput.value = '';
+                    newFolderErrorMsg.style.display = 'none';
+                    setTimeout(() => location.reload(), 100);
+                })
+                .catch(err => {
+                    newFolderErrorMsg.textContent = err.message || 'Failed to create folder.';
+                    newFolderErrorMsg.style.display = 'block';
+                });
+            });
+        }
+
+        // --- Wrap updateFailoverUI to also handle folders ---
+        const originalUpdateFailoverUI = window.updateFailoverUI;
+        window.updateFailoverUI = function(isFailoverOverride) {
+            if (originalUpdateFailoverUI) {
+                originalUpdateFailoverUI(isFailoverOverride);
+            }
+            const isFailover = isFailoverOverride !== undefined ? isFailoverOverride : (getCookie('primary_down') === 'true');
+            const newFolderBtn = document.getElementById('new-folder-btn');
+            if (newFolderBtn) newFolderBtn.disabled = isFailover;
+            
+            document.querySelectorAll('.btn-delete-folder').forEach(btn => {
+                btn.disabled = isFailover;
+            });
+        };
+
         // Global modal close on outside click
         window.addEventListener('click', (e) => {
             const renameModal = document.getElementById('rename-modal');
+            const newFolderModal = document.getElementById('new-folder-modal');
+            const shareModal = document.getElementById('share-modal');
             if (e.target === renameModal) closeRenameModal();
+            if (e.target === shareModal) closeShareModal();
+            if (e.target === newFolderModal) {
+                newFolderModal.classList.remove('active');
+                newFolderInput.value = '';
+                newFolderErrorMsg.style.display = 'none';
+            }
         });
     });
 </script>
